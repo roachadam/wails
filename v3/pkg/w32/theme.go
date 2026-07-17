@@ -96,8 +96,12 @@ var (
 )
 
 func init() {
-	if IsWindowsVersionAtLeast(10, 0, 18334) {
-		// AllowDarkModeForWindow is only available on Windows 10+
+	// The dark-mode uxtheme exports (ordinals 132/133/135/136/104) exist from
+	// Windows 10 1809 (build 17763), which includes Windows Server 2019. The
+	// app-level opt-in below (SetPreferredAppMode == AllowDarkModeForApp on 1809)
+	// must run there for windows to follow the system dark theme, so gate on
+	// 17763 rather than a later build.
+	if IsWindowsVersionAtLeast(10, 0, 17763) {
 		localUXTheme, err := windows.LoadLibrary("uxtheme.dll")
 		if err == nil {
 			procAllowDarkModeForWindow, err := windows.GetProcAddressByOrdinal(localUXTheme, uintptr(133))
@@ -188,6 +192,15 @@ func SupportsImmersiveDarkMode() bool {
 	return IsWindowsVersionAtLeast(10, 0, 18985)
 }
 
+// SupportsImmersiveDarkModeAttribute reports whether the DWM immersive
+// dark-mode window attribute (used to darken the title bar) is honoured. It is
+// available from Windows 10 1903 (build 18362); earlier builds such as Windows
+// Server 2019 (1809, build 17763) must fall back to the legacy per-window
+// property.
+func SupportsImmersiveDarkModeAttribute() bool {
+	return IsWindowsVersionAtLeast(10, 0, 18362)
+}
+
 func SetMenuTheme(hwnd uintptr, useDarkMode bool) {
 	if !SupportsThemes() {
 		return
@@ -224,19 +237,57 @@ func SetMenuTheme(hwnd uintptr, useDarkMode bool) {
 	InvalidateRect(HWND(hwnd), nil, true)
 }
 
+var procSetProp = moduser32.NewProc("SetPropW")
+
+// setWindowProp sets an application-defined window property (SetPropW), used to
+// drive the title-bar colour on Windows 10 1809, which predates the DWM
+// immersive-dark-mode attribute.
+func setWindowProp(hwnd uintptr, name string, value uintptr) {
+	procSetProp.Call(
+		HWND(hwnd),
+		uintptr(unsafe.Pointer(windows.StringToUTF16Ptr(name))),
+		value,
+	)
+}
+
 func SetTheme(hwnd uintptr, useDarkMode bool) {
-	if SupportsThemes() {
+	if !SupportsThemes() {
+		return
+	}
+
+	var winDark int32
+	if useDarkMode {
+		winDark = 1
+	}
+
+	// Opt this window into dark mode (uxtheme). No-op if the proc is unavailable.
+	if AllowDarkModeForWindow != nil {
+		AllowDarkModeForWindow(HWND(hwnd), useDarkMode)
+	}
+
+	if SupportsImmersiveDarkModeAttribute() {
+		// Windows 10 1903+ honours the DWM immersive-dark-mode window attribute,
+		// which sets the title-bar colour regardless of the system theme.
 		attr := DwmwaUseImmersiveDarkModeBefore20h1
 		if SupportsImmersiveDarkMode() {
 			attr = DwmwaUseImmersiveDarkMode
 		}
-		var winDark int32
-		if useDarkMode {
-			winDark = 1
-		}
 		dwmSetWindowAttribute(hwnd, attr, unsafe.Pointer(&winDark), unsafe.Sizeof(winDark))
-		SetMenuTheme(hwnd, useDarkMode)
+	} else {
+		// Windows 10 1809 (e.g. Windows Server 2019) predates that attribute. The
+		// exact lever varies across 1809 revisions, so apply both the early DWM
+		// attribute and the undocumented per-window property, then force the
+		// non-client (title-bar) area to repaint so the change takes effect.
+		// This combination is verified on Windows Server 2019 build 17763.
+		dwmSetWindowAttribute(hwnd, DwmwaUseImmersiveDarkModeBefore20h1, unsafe.Pointer(&winDark), unsafe.Sizeof(winDark))
+		setWindowProp(hwnd, "UseImmersiveDarkModeColors", uintptr(winDark))
+		if RefreshImmersiveColorPolicyState != nil {
+			RefreshImmersiveColorPolicyState()
+		}
+		SetWindowPos(HWND(hwnd), 0, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED)
 	}
+
+	SetMenuTheme(hwnd, useDarkMode)
 }
 
 func EnableTranslucency(hwnd uintptr, backdrop uint32) {
