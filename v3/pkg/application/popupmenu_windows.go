@@ -97,11 +97,29 @@ func (p *Win32Menu) newMenu() w32.HMENU {
 	return w32.CreateMenu()
 }
 
-// buildMenu populates parentMenu from inputMenu. Any native AppendMenu or
+// buildMenuBar populates the top level of an application menu. Those items form
+// the menu bar strip, which MenuBarWndProc already draws, so they are left to
+// the system. Everything hanging below them is a popup and is built by
+// buildPopupMenu.
+func (p *Win32Menu) buildMenuBar(parentMenu w32.HMENU, inputMenu *Menu) error {
+	return p.buildMenuLevel(parentMenu, inputMenu, false)
+}
+
+// buildPopupMenu populates a dropdown, a context menu, or a nested submenu.
+// Every menu below the bar is a popup, so its items are owner-drawn and take
+// their colours from the window's theme rather than from uxtheme.
+func (p *Win32Menu) buildPopupMenu(parentMenu w32.HMENU, inputMenu *Menu) error {
+	return p.buildMenuLevel(parentMenu, inputMenu, true)
+}
+
+// buildMenuLevel populates parentMenu from inputMenu. Any native AppendMenu or
 // SetMenuIcons failure returns an error; recursive submenu builds propagate
 // the error so the outer Update can back out cleanly instead of attaching a
 // half-built submenu via MF_POPUP.
-func (p *Win32Menu) buildMenu(parentMenu w32.HMENU, inputMenu *Menu, isMenuBar bool) error {
+//
+// Call it through buildMenuBar or buildPopupMenu rather than directly, so the
+// owner-draw decision is named at the call site.
+func (p *Win32Menu) buildMenuLevel(parentMenu w32.HMENU, inputMenu *Menu, ownerDraw bool) error {
 	currentRadioGroup := RadioGroup{}
 	for _, item := range inputMenu.items {
 		p.currentMenuID++
@@ -110,7 +128,7 @@ func (p *Win32Menu) buildMenu(parentMenu w32.HMENU, inputMenu *Menu, isMenuBar b
 
 		menuItemImpl := newMenuItemImpl(item, parentMenu, itemID)
 		menuItemImpl.parent = inputMenu
-		menuItemImpl.ownerDraw = !isMenuBar
+		menuItemImpl.ownerDraw = ownerDraw
 		item.impl = menuItemImpl
 
 		if item.Hidden() {
@@ -129,7 +147,6 @@ func (p *Win32Menu) buildMenu(parentMenu w32.HMENU, inputMenu *Menu, isMenuBar b
 		// Popup items are owner-drawn so wails controls the text colour rather
 		// than inheriting it from uxtheme, which follows the system light/dark
 		// setting. The menu bar keeps its existing UAH drawing.
-		ownerDraw := !isMenuBar
 		if ownerDraw {
 			flags = flags | w32.MF_OWNERDRAW
 		}
@@ -165,7 +182,7 @@ func (p *Win32Menu) buildMenu(parentMenu w32.HMENU, inputMenu *Menu, isMenuBar b
 		if item.submenu != nil {
 			flags = flags | w32.MF_POPUP
 			newSubmenu := p.newMenu()
-			if err := p.buildMenu(newSubmenu, item.submenu, false); err != nil {
+			if err := p.buildPopupMenu(newSubmenu, item.submenu); err != nil {
 				// Submenu was allocated but never attached via AppendMenu, so
 				// the outer DestroyMenu on parentMenu won't reach it. Free it
 				// here to avoid leaking the HMENU.
@@ -250,7 +267,14 @@ func (p *Win32Menu) Update() {
 	p.currentMenuID = MenuItemMsgID
 	p.bitmaps = nil
 
-	if err := p.buildMenu(newHMENU, p.menuData, !p.isPopup); err != nil {
+	// A context menu is a popup in its own right; an application menu starts at
+	// the bar, and only what hangs below it is a popup.
+	build := p.buildMenuBar
+	if p.isPopup {
+		build = p.buildPopupMenu
+	}
+
+	if err := build(newHMENU, p.menuData); err != nil {
 		globalApplication.error("menu rebuild failed, keeping previous menu: %v", err)
 		// Release bitmaps allocated during the partial build, destroy the
 		// partial HMENU, then restore the previous state.

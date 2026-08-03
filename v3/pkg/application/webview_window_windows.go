@@ -46,7 +46,10 @@ type windowsWebviewWindow struct {
 	currentlyOpenContextMenu *Win32Menu
 	// menuOwnerDrawDark selects the palette for owner-drawn popup menu items.
 	// It follows the window's resolved theme rather than the system setting.
-	menuOwnerDrawDark       bool
+	menuOwnerDrawDark bool
+	// menuMetrics caches the owner-draw layout for the window's current DPI.
+	// Rebuilt when the window moves to a display with a different DPI.
+	menuMetrics             *menuMetrics
 	ignoreDPIChangeResizing bool
 
 	// Fullscreen flags
@@ -862,6 +865,10 @@ func (w *windowsWebviewWindow) destroy() {
 		w32.EnableWindow(w.parentHWND, true)
 		w.parentHWND = 0
 	}
+
+	// Release the cached owner-draw menu font before the window goes away.
+	w.menuMetrics.release()
+	w.menuMetrics = nil
 
 	w.parent.markAsDestroyed()
 	// destroy the window
