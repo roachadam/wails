@@ -23,6 +23,8 @@ var (
 	procCloseEnhMetaFile          = modgdi32.NewProc("CloseEnhMetaFile")
 	procCopyEnhMetaFile           = modgdi32.NewProc("CopyEnhMetaFileW")
 	procCreateBrushIndirect       = modgdi32.NewProc("CreateBrushIndirect")
+	procCreateBitmap              = modgdi32.NewProc("CreateBitmap")
+	procCreateCompatibleBitmap    = modgdi32.NewProc("CreateCompatibleBitmap")
 	procCreateCompatibleDC        = modgdi32.NewProc("CreateCompatibleDC")
 	procCreateDC                  = modgdi32.NewProc("CreateDCW")
 	procCreateDIBSection          = modgdi32.NewProc("CreateDIBSection")
@@ -160,6 +162,36 @@ func CreateCompatibleDC(hdc HDC) HDC {
 	}
 
 	return HDC(ret)
+}
+
+// CreateCompatibleBitmap creates a bitmap matching hdc's colour format.
+//
+// Returns 0 on failure rather than panicking, so callers can fall back.
+func CreateCompatibleBitmap(hdc HDC, width, height int) HBITMAP {
+	ret, _, _ := procCreateCompatibleBitmap.Call(
+		uintptr(hdc),
+		uintptr(width),
+		uintptr(height))
+
+	return HBITMAP(ret)
+}
+
+// CreateBitmap creates a device-independent bitmap. Pass planes=1, bitCount=1
+// and bits=nil for the monochrome bitmap used as a blit mask: BitBlt from a
+// monochrome source to a colour destination maps 0 to the destination's text
+// colour and 1 to its background colour, which is how a themed glyph gets
+// recoloured.
+//
+// Returns 0 on failure rather than panicking, so callers can fall back.
+func CreateBitmap(width, height int, planes, bitCount uint32, bits unsafe.Pointer) HBITMAP {
+	ret, _, _ := procCreateBitmap.Call(
+		uintptr(width),
+		uintptr(height),
+		uintptr(planes),
+		uintptr(bitCount),
+		uintptr(bits))
+
+	return HBITMAP(ret)
 }
 
 func CreateDC(lpszDriver, lpszDevice, lpszOutput *uint16, lpInitData *DEVMODE) HDC {
