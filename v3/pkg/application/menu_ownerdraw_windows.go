@@ -351,6 +351,34 @@ func (m *menuMetrics) withMenuFont(hdc w32.HDC, fn func()) {
 	}
 }
 
+// widestAccelerator returns the width of the widest accelerator in the popup
+// that item belongs to, or 0 if none of them has one.
+//
+// Windows sizes the accelerator column once for the whole popup so the
+// accelerators line up, and reserves it on every item including those without
+// one. Measuring each item against only its own accelerator makes the popup as
+// wide as its longest label and no wider, which leaves the accelerators nowhere
+// to sit - a 63px shortfall against the native menu in the case measured here.
+//
+// hdc must already have the menu font selected.
+func widestAccelerator(hdc w32.HDC, item *MenuItem) int {
+	impl, ok := item.impl.(*windowsMenuItem)
+	if !ok || impl.parent == nil {
+		return 0
+	}
+
+	widest := 0
+	for _, sibling := range impl.parent.items {
+		if sibling.accelerator == nil {
+			continue
+		}
+		if w, _ := measureText(hdc, sibling.accelerator.String()); w > widest {
+			widest = w
+		}
+	}
+	return widest
+}
+
 func measureText(hdc w32.HDC, s string) (int, int) {
 	if s == "" {
 		return 0, 0
@@ -436,7 +464,7 @@ func (w *windowsWebviewWindow) handleMeasureMenuItem(lparam uintptr) bool {
 		return true
 	}
 
-	label, accel := menuItemLabelAccel(item)
+	label, _ := menuItemLabelAccel(item)
 
 	hdc := w32.GetDC(w.hwnd)
 	if hdc == 0 {
@@ -447,12 +475,17 @@ func (w *windowsWebviewWindow) handleMeasureMenuItem(lparam uintptr) bool {
 	var labelW, labelH, accelW int
 	metrics.withMenuFont(hdc, func() {
 		labelW, labelH = measureText(hdc, label)
-		accelW, _ = measureText(hdc, accel)
+		// The accelerator column is sized by the widest accelerator anywhere in
+		// this popup, not by this item's own. Windows reserves it on every item
+		// so the accelerators line up in a column; measuring per item makes the
+		// popup as wide as its longest label alone, and accelerators then have
+		// nowhere to sit.
+		accelW = widestAccelerator(hdc, item)
 	})
 	w32.ReleaseDC(w.hwnd, hdc)
 
-	// The submenu column is reserved on every item, matching Windows, so an
-	// arrow can never be drawn over a label that was measured without it.
+	// The submenu column is likewise reserved on every item, so an arrow can
+	// never be drawn over a label that was measured without it.
 	width := metrics.textLeft() + labelW + metrics.itemPadRight + metrics.submenuWidth
 	if accelW > 0 {
 		width += metrics.accelGap + accelW
