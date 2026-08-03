@@ -409,7 +409,31 @@ func drawMenuString(hdc w32.HDC, s string, rect *w32.RECT, flags uint32) {
 	w32.DrawText(hdc, w32.MustStringToUTF16(s), -1, rect, flags)
 }
 
+// systemMenuColours reads the palette from the system rather than using either
+// built-in one.
+//
+// This is what High Contrast needs. Those schemes are an accessibility setting -
+// the user has chosen specific colours, often for legibility reasons - so
+// painting our own dark or light palette over them defeats the point, and can
+// produce combinations with no contrast at all. updateTheme already declines to
+// theme anything when High Contrast is on; owner-draw has to do the same.
+func systemMenuColours() menuColours {
+	sys := func(index int) uint32 { return uint32(w32.GetSysColor(index)) }
+	return menuColours{
+		background:      sys(w32.COLOR_MENU),
+		text:            sys(w32.COLOR_MENUTEXT),
+		checkBackground: sys(w32.COLOR_HIGHLIGHT),
+		disabledText:    sys(w32.COLOR_GRAYTEXT),
+		selectedBg:      sys(w32.COLOR_HIGHLIGHT),
+		selectedText:    sys(w32.COLOR_HIGHLIGHTTEXT),
+		separator:       sys(w32.COLOR_BTNSHADOW),
+	}
+}
+
 func (w *windowsWebviewWindow) menuColours() menuColours {
+	if w32.IsCurrentlyHighContrastMode() {
+		return systemMenuColours()
+	}
 	if w.menuOwnerDrawDark {
 		return darkMenuColours
 	}
