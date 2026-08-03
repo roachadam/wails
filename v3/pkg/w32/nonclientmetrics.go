@@ -88,11 +88,14 @@ func GetNonClientMetricsForDpi(dpi UINT) (*NONCLIENTMETRICS, bool) {
 
 // SystemMetricForDpi returns GetSystemMetrics(index) scaled for dpi, falling
 // back to the unscaled value when the DPI-aware entry point is unavailable.
+//
+// The result is returned as-is rather than being checked for 0. Zero is a
+// legitimate value for several metrics, so treating it as failure would
+// silently substitute the primary display's unscaled value for a correct
+// scaled one. Availability of the entry point is the only thing worth testing.
 func SystemMetricForDpi(index int, dpi UINT) int {
 	if dpi != 0 && HasGetSystemMetricsForDpiFunc() {
-		if v := GetSystemMetricsForDpi(index, dpi); v != 0 {
-			return v
-		}
+		return GetSystemMetricsForDpi(index, dpi)
 	}
 	return GetSystemMetrics(index)
 }

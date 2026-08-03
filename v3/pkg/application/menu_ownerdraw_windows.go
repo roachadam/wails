@@ -321,12 +321,21 @@ func (w *windowsWebviewWindow) currentMenuMetrics() *menuMetrics {
 // its item, so getMenuItemByID returns nil for every separator. drawMapping is
 // populated for all items, separators included, which lets separators be
 // identified explicitly rather than inferred from a failed lookup.
+// It resolves only items wails actually owner-draws. A menu bar item is present
+// in drawMapping too, but it is drawn by MenuBarWndProc, so claiming it here
+// would starve that handler and paint the bar with popup styling.
 func (w *windowsWebviewWindow) menuItemFor(itemID uint32) (*MenuItem, bool) {
 	if w.menu == nil || w.menu.drawMapping == nil {
 		return nil, false
 	}
 	item, ok := w.menu.drawMapping[int(itemID)]
-	return item, ok && item != nil
+	if !ok || item == nil {
+		return nil, false
+	}
+	if impl, ok := item.impl.(*windowsMenuItem); !ok || !impl.ownerDraw {
+		return nil, false
+	}
+	return item, true
 }
 
 func menuItemLabelAccel(item *MenuItem) (label string, accel string) {
@@ -369,7 +378,10 @@ func widestAccelerator(hdc w32.HDC, item *MenuItem) int {
 
 	widest := 0
 	for _, sibling := range impl.parent.items {
-		if sibling.accelerator == nil {
+		// Hidden items are skipped by buildMenuLevel before AppendMenu, so they
+		// occupy no row; reserving width for an accelerator that will never be
+		// drawn would just widen the popup.
+		if sibling.accelerator == nil || sibling.Hidden() {
 			continue
 		}
 		if w, _ := measureText(hdc, sibling.accelerator.String()); w > widest {
@@ -414,11 +426,18 @@ func (w *windowsWebviewWindow) menuColours() menuColours {
 func (m *menuMetrics) drawCheck(hdc w32.HDC, rect w32.RECT, colours menuColours, selected, disabled, radio bool) {
 	height := int(rect.Bottom - rect.Top)
 
+	// Centre the glyph in the check column rather than pinning it to the left
+	// edge. checkMarginX is the padding either side of it, and the item's own
+	// left padding is 0 under the visual style, so without this the tick sits
+	// against the popup border.
+	left := m.itemPadLeft + m.checkMarginX/2
+	top := max((height-m.checkHeight)/2, 0)
+
 	panel := w32.RECT{
-		Left:   rect.Left + int32(m.itemPadLeft),
-		Right:  rect.Left + int32(m.itemPadLeft+m.checkWidth),
-		Top:    rect.Top + int32(max((height-m.checkHeight)/2, 0)),
-		Bottom: rect.Top + int32(max((height-m.checkHeight)/2, 0)+m.checkHeight),
+		Left:   rect.Left + int32(left),
+		Right:  rect.Left + int32(left+m.checkWidth),
+		Top:    rect.Top + int32(top),
+		Bottom: rect.Top + int32(top+m.checkHeight),
 	}
 
 	if !selected {
@@ -450,14 +469,15 @@ func (w *windowsWebviewWindow) handleMeasureMenuItem(lparam uintptr) bool {
 		return false
 	}
 
-	metrics := w.currentMenuMetrics()
-
+	// Not one of ours: leave the message for whoever owns it rather than
+	// reporting a made-up size.
 	item, ok := w.menuItemFor(mis.ItemID)
 	if !ok {
-		mis.ItemHeight = uint32(metrics.minHeight)
-		mis.ItemWidth = uint32(metrics.textLeft())
-		return true
+		return false
 	}
+
+	metrics := w.currentMenuMetrics()
+
 	if item.IsSeparator() {
 		mis.ItemHeight = uint32(metrics.sepHeight)
 		mis.ItemWidth = 0
@@ -505,18 +525,20 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 		return false
 	}
 
+	// Not one of ours - a menu bar item, or a menu belonging to another
+	// Win32Menu. Decline so MenuBarWndProc still sees it.
+	item, ok := w.menuItemFor(dis.ItemID)
+	if !ok {
+		return false
+	}
+
 	metrics := w.currentMenuMetrics()
 	colours := w.menuColours()
 	rect := dis.RcItem
 
-	item, ok := w.menuItemFor(dis.ItemID)
-	var label, accel string
-	var hasSubmenu, isSeparator bool
-	if ok {
-		label, accel = menuItemLabelAccel(item)
-		hasSubmenu = item.submenu != nil
-		isSeparator = item.IsSeparator()
-	}
+	label, accel := menuItemLabelAccel(item)
+	hasSubmenu := item.submenu != nil
+	isSeparator := item.IsSeparator()
 
 	selected := dis.ItemState&w32.ODS_SELECTED != 0
 	disabled := dis.ItemState&(w32.ODS_GRAYED|w32.ODS_DISABLED) != 0
@@ -528,14 +550,6 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 	bgBrush := w32.CreateSolidBrush(bg)
 	w32.FillRect(dis.HDC, &rect, bgBrush)
 	w32.DeleteObject(w32.HGDIOBJ(bgBrush))
-
-	// Only a genuine separator draws a rule. An item that failed to resolve gets
-	// the background and nothing else - drawing a rule there would disguise a
-	// lookup failure as a deliberate separator, which is how the submenu items
-	// silently rendered as blank rules.
-	if !ok {
-		return true
-	}
 
 	if isSeparator {
 		lineBrush := w32.CreateSolidBrush(colours.separator)
@@ -561,12 +575,14 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 		textColour = colours.selectedText
 	}
 
+	// dis.HDC belongs to Windows' menu painting, so every attribute changed here
+	// is restored before returning - not just the font.
 	var oldFont w32.HGDIOBJ
 	if metrics.font != 0 {
 		oldFont = w32.SelectObject(dis.HDC, w32.HGDIOBJ(metrics.font))
 	}
-	w32.SetBkMode(dis.HDC, w32.TRANSPARENT)
-	w32.SetTextColor(dis.HDC, w32.COLORREF(textColour))
+	oldBkMode := w32.SetBkMode(dis.HDC, w32.TRANSPARENT)
+	oldTextColour := w32.SetTextColor(dis.HDC, w32.COLORREF(textColour))
 
 	if dis.ItemState&w32.ODS_CHECKED != 0 {
 		metrics.drawCheck(dis.HDC, rect, colours, selected, disabled, item.IsRadio())
@@ -592,6 +608,8 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 		drawMenuString(dis.HDC, accel, &accelRect, w32.DT_RIGHT|w32.DT_SINGLELINE|w32.DT_VCENTER)
 	}
 
+	w32.SetTextColor(dis.HDC, oldTextColour)
+	w32.SetBkMode(dis.HDC, oldBkMode)
 	if oldFont != 0 {
 		w32.SelectObject(dis.HDC, oldFont)
 	}
