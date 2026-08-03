@@ -112,10 +112,32 @@ func (p *Win32Menu) buildMenuBar(parentMenu w32.HMENU, inputMenu *Menu) error {
 }
 
 // buildPopupMenu populates a dropdown, a context menu, or a nested submenu.
-// Every menu below the bar is a popup, so its items are owner-drawn and take
-// their colours from the window's theme rather than from uxtheme.
+// Its items are owner-drawn only for the application menu - see ownerDrawPopups.
 func (p *Win32Menu) buildPopupMenu(parentMenu w32.HMENU, inputMenu *Menu) error {
-	return p.buildMenuLevel(parentMenu, inputMenu, true)
+	return p.buildMenuLevel(parentMenu, inputMenu, p.ownerDrawPopups())
+}
+
+// ownerDrawPopups reports whether wails paints this menu's popup items itself.
+//
+// Only the application menu qualifies, and being a popup is not the test.
+// Owner-draw exists to supply a text colour to match a background wails has
+// painted, and updateTheme paints that background on exactly one HMENU:
+// w.menu.menu, the application menu. Context menus and system tray menus are
+// created by NewPopupMenu, never receive that background, and render correctly
+// as native menus - so owner-drawing them fixes nothing.
+//
+// It also breaks them. Their items resolve through the window's application
+// menu mapping, and because every Win32Menu restarts its ids at MenuItemMsgID,
+// a context menu item aliases whichever application menu item shares its id and
+// is drawn with that item's label. A system tray menu is worse still: its owner
+// window handles neither WM_MEASUREITEM nor WM_DRAWITEM, so its items get no
+// size and are never painted at all.
+//
+// parentWindow is set only by NewApplicationMenu, which makes it exactly the
+// "this menu belongs to a window whose theme we manage and whose WndProc
+// handles owner-draw" test.
+func (p *Win32Menu) ownerDrawPopups() bool {
+	return p.parentWindow != nil
 }
 
 // buildMenuLevel populates parentMenu from inputMenu. Any native AppendMenu or
