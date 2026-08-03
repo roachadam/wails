@@ -157,93 +157,6 @@ func newMarlettFont(height int) w32.HFONT {
 	return w32.CreateFontIndirect(&lf)
 }
 
-// drawThemedGlyph paints a themed part in an arbitrary colour, by drawing it
-// onto white, reducing that to a monochrome mask, and blitting the mask.
-//
-// This is the only way to use the visual style's own artwork here. Themed menus
-// draw the submenu arrow as a chevron bitmap rather than a font glyph, so no
-// font can supply it - Marlett only has the classic filled triangles. But
-// DrawThemeBackground paints in the theme's colours, which on a light system is
-// a dark chevron, invisible on a dark menu. The mask keeps the shape and
-// discards the colour: BitBlt from a 1bpp source maps 0 to the destination's
-// text colour and 1 to its background colour.
-//
-// Reports false if any step fails, so the caller can fall back to a glyph.
-func drawThemedGlyph(hwnd w32.HWND, hdc w32.HDC, part, state int32, dest w32.RECT, fg, bg uint32) bool {
-	width, height := int(dest.Right-dest.Left), int(dest.Bottom-dest.Top)
-	if width <= 0 || height <= 0 {
-		return false
-	}
-
-	hTheme := w32.OpenThemeData(hwnd, "Menu")
-	if hTheme == 0 {
-		return false
-	}
-	defer w32.CloseThemeData(hTheme)
-
-	colourDC := w32.CreateCompatibleDC(hdc)
-	if colourDC == 0 {
-		return false
-	}
-	defer w32.DeleteDC(colourDC)
-
-	colourBmp := w32.CreateCompatibleBitmap(hdc, width, height)
-	if colourBmp == 0 {
-		return false
-	}
-	defer w32.DeleteObject(w32.HGDIOBJ(colourBmp))
-	oldColour := w32.SelectObject(colourDC, w32.HGDIOBJ(colourBmp))
-	defer func() {
-		if oldColour != 0 {
-			w32.SelectObject(colourDC, oldColour)
-		}
-	}()
-
-	// White ground, so the colour-to-monochrome conversion below has an
-	// unambiguous background to key on.
-	white := w32.CreateSolidBrush(rgb(255, 255, 255))
-	full := w32.RECT{Right: int32(width), Bottom: int32(height)}
-	w32.FillRect(colourDC, &full, white)
-	w32.DeleteObject(w32.HGDIOBJ(white))
-
-	if !w32.DrawThemeBackground(hTheme, colourDC, part, state, &full) {
-		return false
-	}
-
-	monoDC := w32.CreateCompatibleDC(hdc)
-	if monoDC == 0 {
-		return false
-	}
-	defer w32.DeleteDC(monoDC)
-
-	monoBmp := w32.CreateBitmap(width, height, 1, 1, nil)
-	if monoBmp == 0 {
-		return false
-	}
-	defer w32.DeleteObject(w32.HGDIOBJ(monoBmp))
-	oldMono := w32.SelectObject(monoDC, w32.HGDIOBJ(monoBmp))
-	defer func() {
-		if oldMono != 0 {
-			w32.SelectObject(monoDC, oldMono)
-		}
-	}()
-
-	// Colour to monochrome keys on the source's background colour: pixels
-	// matching it become 1, everything else 0. So the white ground becomes 1 and
-	// the chevron becomes 0.
-	w32.SetBkColor(colourDC, w32.COLORREF(rgb(255, 255, 255)))
-	w32.BitBlt(monoDC, 0, 0, width, height, colourDC, 0, 0, w32.SRCCOPY)
-
-	// Monochrome to colour maps 0 to the text colour and 1 to the background.
-	previousText := w32.SetTextColor(hdc, w32.COLORREF(fg))
-	previousBk := w32.SetBkColor(hdc, w32.COLORREF(bg))
-	w32.BitBlt(hdc, int(dest.Left), int(dest.Top), width, height, monoDC, 0, 0, w32.SRCCOPY)
-	w32.SetTextColor(hdc, previousText)
-	w32.SetBkColor(hdc, previousBk)
-
-	return true
-}
-
 // drawSymbol renders one Marlett glyph centred in rect using the given font.
 func drawSymbol(hdc w32.HDC, font w32.HFONT, glyph string, rect w32.RECT) {
 	if font == 0 {
@@ -785,17 +698,7 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 		arrow := rect
 		arrow.Left = rect.Right - int32(metrics.itemPadRight+metrics.submenuWidth)
 		arrow.Right = rect.Right - int32(metrics.itemPadRight)
-
-		// Prefer the visual style's own chevron, recoloured. Marlett's arrow is
-		// the classic filled triangle, which is a Windows glyph but not the one
-		// a themed menu draws, so it is the fallback rather than the default.
-		state := int32(w32.MSM_NORMAL)
-		if disabled {
-			state = w32.MSM_DISABLED
-		}
-		if !drawThemedGlyph(w.hwnd, dis.HDC, w32.MENU_POPUPSUBMENU, state, arrow, textColour, bg) {
-			drawSymbol(dis.HDC, metrics.submenuFont, marlettSubmenu, arrow)
-		}
+		drawSymbol(dis.HDC, metrics.submenuFont, marlettSubmenu, arrow)
 	} else if accel != "" {
 		// Drawn in the item's own text colour. Windows does not dim
 		// accelerators - using the disabled colour made them look disabled,

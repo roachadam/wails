@@ -65,24 +65,6 @@ var (
 	procGetThemeMargins  = uxtheme.NewProc("GetThemeMargins")
 )
 
-// DrawThemeBackground paints a themed part into hdc.
-//
-// It paints in the visual style's own colours, which is why owner-drawn menus
-// cannot use it directly - a light system's glyph would be dark on a dark menu.
-// It is usable via a monochrome mask: draw the part onto white, convert to 1bpp,
-// then blit that with the colours the caller wants.
-func DrawThemeBackground(hTheme HTHEME, hdc HDC, iPartId, iStateId int32, rect *RECT) bool {
-	ret, _, _ := procDrawThemeBackground.Call(
-		uintptr(hTheme),
-		uintptr(hdc),
-		uintptr(iPartId),
-		uintptr(iStateId),
-		uintptr(unsafe.Pointer(rect)),
-		0, // pClipRect: NULL, no clipping
-	)
-	return ret == 0 // S_OK
-}
-
 // GetThemePartSize returns the size of a themed part.
 //
 // These are the metrics the visual style actually draws with. GetSystemMetrics
