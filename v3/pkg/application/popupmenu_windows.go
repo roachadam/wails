@@ -101,7 +101,7 @@ func (p *Win32Menu) newMenu() w32.HMENU {
 // SetMenuIcons failure returns an error; recursive submenu builds propagate
 // the error so the outer Update can back out cleanly instead of attaching a
 // half-built submenu via MF_POPUP.
-func (p *Win32Menu) buildMenu(parentMenu w32.HMENU, inputMenu *Menu) error {
+func (p *Win32Menu) buildMenu(parentMenu w32.HMENU, inputMenu *Menu, isMenuBar bool) error {
 	currentRadioGroup := RadioGroup{}
 	for _, item := range inputMenu.items {
 		p.currentMenuID++
@@ -110,6 +110,7 @@ func (p *Win32Menu) buildMenu(parentMenu w32.HMENU, inputMenu *Menu) error {
 
 		menuItemImpl := newMenuItemImpl(item, parentMenu, itemID)
 		menuItemImpl.parent = inputMenu
+		menuItemImpl.ownerDraw = !isMenuBar
 		item.impl = menuItemImpl
 
 		if item.Hidden() {
@@ -125,6 +126,13 @@ func (p *Win32Menu) buildMenu(parentMenu w32.HMENU, inputMenu *Menu) error {
 		}
 
 		flags := uint32(w32.MF_STRING)
+		// Popup items are owner-drawn so wails controls the text colour rather
+		// than inheriting it from uxtheme, which follows the system light/dark
+		// setting. The menu bar keeps its existing UAH drawing.
+		ownerDraw := !isMenuBar
+		if ownerDraw {
+			flags = flags | w32.MF_OWNERDRAW
+		}
 		if item.disabled {
 			flags = flags | w32.MF_GRAYED
 		}
@@ -157,7 +165,7 @@ func (p *Win32Menu) buildMenu(parentMenu w32.HMENU, inputMenu *Menu) error {
 		if item.submenu != nil {
 			flags = flags | w32.MF_POPUP
 			newSubmenu := p.newMenu()
-			if err := p.buildMenu(newSubmenu, item.submenu); err != nil {
+			if err := p.buildMenu(newSubmenu, item.submenu, false); err != nil {
 				// Submenu was allocated but never attached via AppendMenu, so
 				// the outer DestroyMenu on parentMenu won't reach it. Free it
 				// here to avoid leaking the HMENU.
@@ -242,7 +250,7 @@ func (p *Win32Menu) Update() {
 	p.currentMenuID = MenuItemMsgID
 	p.bitmaps = nil
 
-	if err := p.buildMenu(newHMENU, p.menuData); err != nil {
+	if err := p.buildMenu(newHMENU, p.menuData, !p.isPopup); err != nil {
 		globalApplication.error("menu rebuild failed, keeping previous menu: %v", err)
 		// Release bitmaps allocated during the partial build, destroy the
 		// partial HMENU, then restore the previous state.

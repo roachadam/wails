@@ -20,6 +20,9 @@ type windowsMenuItem struct {
 	itemType menuItemType
 	hidden   bool
 	submenu  w32.HMENU
+	// ownerDraw marks popup items that wails paints itself. Menu bar items keep
+	// the existing UAH drawing and stay false.
+	ownerDraw bool
 
 	// bitmap holds the HBITMAP handle installed by the most recent
 	// setBitmap call so it can be released before a new one is installed.
@@ -160,6 +163,13 @@ func (m *windowsMenuItem) getMenuInfo() *w32.MENUITEMINFO {
 		}
 		mii.DwTypeData = w32.MustStringToUTF16Ptr(thisText)
 		mii.Cch = uint32(len([]rune(thisText)))
+	}
+	// Preserve owner-draw across runtime updates. getMenuInfo feeds
+	// SetMenuItemInfo from setLabel/setChecked/setDisabled, which target the
+	// displayed menu; omitting the bit here would silently revert the item to
+	// system drawing after any mutation. Menu bar items are not owner-drawn.
+	if m.ownerDraw {
+		mii.FType |= w32.MFT_OWNERDRAW
 	}
 	mii.WID = uint32(m.id)
 	if m.Enabled() {

@@ -22,9 +22,9 @@ import (
 	"github.com/wailsapp/wails/v3/internal/sliceutil"
 	"github.com/wailsapp/wails/v3/internal/webview2/webviewloader"
 
+	"github.com/wailsapp/wails/v3/internal/webview2/pkg/edge"
 	"github.com/wailsapp/wails/v3/pkg/events"
 	"github.com/wailsapp/wails/v3/pkg/w32"
-	"github.com/wailsapp/wails/v3/internal/webview2/pkg/edge"
 )
 
 var edgeMap = map[string]uintptr{
@@ -44,7 +44,10 @@ type windowsWebviewWindow struct {
 	hwnd                     w32.HWND
 	menu                     *Win32Menu
 	currentlyOpenContextMenu *Win32Menu
-	ignoreDPIChangeResizing  bool
+	// menuOwnerDrawDark selects the palette for owner-drawn popup menu items.
+	// It follows the window's resolved theme rather than the system setting.
+	menuOwnerDrawDark       bool
+	ignoreDPIChangeResizing bool
 
 	// Fullscreen flags
 	isCurrentlyFullscreen   bool
@@ -1481,6 +1484,10 @@ func (w *windowsWebviewWindow) updateTheme(isDarkMode bool) {
 
 	w32.SetTheme(w.hwnd, isDarkMode)
 
+	// Owner-drawn menus pick their palette from the window's resolved theme, not
+	// from the system setting, so an explicit Dark theme stays dark on a light OS.
+	w.menuOwnerDrawDark = isDarkMode
+
 	// Clear any existing theme first
 	if w.menubarTheme != nil && !isDarkMode {
 		// Reset menu to default Windows theme when switching to light mode
@@ -1589,6 +1596,19 @@ func (w *windowsWebviewWindow) isActive() bool {
 }
 
 func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintptr {
+
+	// Owner-drawn popup menu items must be handled before MenuBarWndProc, whose
+	// own WM_DRAWITEM case targets the menu bar (centred text, title-bar brush).
+	switch msg {
+	case w32.WM_MEASUREITEM:
+		if w.handleMeasureMenuItem(lparam) {
+			return 1
+		}
+	case w32.WM_DRAWITEM:
+		if w.handleDrawMenuItem(lparam) {
+			return 1
+		}
+	}
 
 	// Use the original implementation that works perfectly for maximized
 	processed, code := w32.MenuBarWndProc(w.hwnd, msg, wparam, lparam, w.menubarTheme)
