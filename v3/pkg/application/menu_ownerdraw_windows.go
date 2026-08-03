@@ -89,6 +89,11 @@ type menuMetrics struct {
 	dpi w32.UINT
 
 	font w32.HFONT
+	// checkFont and submenuFont are Marlett at the sizes the theme reports for
+	// the checkmark and the submenu arrow. Two fonts because those parts are
+	// different sizes - 16px and 9px on the stock style.
+	checkFont   w32.HFONT
+	submenuFont w32.HFONT
 
 	// Raw measurements, combined by finalise.
 	checkWidth   int // MENU_POPUPCHECK size
@@ -105,8 +110,10 @@ type menuMetrics struct {
 	// Derived layout.
 	gutterWidth int
 	// submenuWidth is reserved on the right of every item, as Windows does, so
-	// the arrow never overlaps a long label.
+	// the arrow never overlaps a long label. submenuGlyph is the arrow itself,
+	// without the margins that make up the rest of that column.
 	submenuWidth int
+	submenuGlyph int
 	accelGap     int
 	minHeight    int
 	sepHeight    int
@@ -118,6 +125,49 @@ type menuMetrics struct {
 // accelGapChars is the space between a label and its accelerator, in average
 // character widths of the menu font. The theme has no property for it.
 const accelGapChars = 4
+
+// Marlett is the symbol font Windows draws menu glyphs from. Being a font it
+// renders in whatever text colour is set, which is why it can supply Windows'
+// own shapes without the colour problem that rules out DrawThemeBackground.
+//
+// The codes were read off a rendering of the whole font rather than recalled:
+// 4 is the larger triangle used for scrollbars, 8 the smaller one menus use,
+// and b and i are heavier variants of the check and the dot.
+const (
+	marlettFace    = "Marlett"
+	marlettCheck   = "a" // 0x61, checkmark
+	marlettBullet  = "h" // 0x68, filled dot for a radio item
+	marlettSubmenu = "8" // 0x38, small right-pointing triangle
+)
+
+// newMarlettFont builds Marlett at the given cell height. SYMBOL_CHARSET
+// matters: Marlett has no ANSI mapping, and requesting the wrong charset gets a
+// substituted font with entirely different glyphs.
+func newMarlettFont(height int) w32.HFONT {
+	if height <= 0 {
+		return 0
+	}
+	lf := w32.LOGFONT{
+		Height:  int32(height),
+		Weight:  400, // FW_NORMAL
+		CharSet: 2,   // SYMBOL_CHARSET
+		Quality: 5,   // CLEARTYPE_QUALITY
+	}
+	copy(lf.FaceName[:], w32.MustStringToUTF16(marlettFace))
+	return w32.CreateFontIndirect(&lf)
+}
+
+// drawSymbol renders one Marlett glyph centred in rect using the given font.
+func drawSymbol(hdc w32.HDC, font w32.HFONT, glyph string, rect w32.RECT) {
+	if font == 0 {
+		return
+	}
+	old := w32.SelectObject(hdc, w32.HGDIOBJ(font))
+	drawMenuString(hdc, glyph, &rect, w32.DT_CENTER|w32.DT_SINGLELINE|w32.DT_VCENTER)
+	if old != 0 {
+		w32.SelectObject(hdc, old)
+	}
+}
 
 // menuFontForDpi returns the user's menu font for the given DPI.
 //
@@ -160,6 +210,12 @@ func newMenuMetrics(hwnd w32.HWND) *menuMetrics {
 
 	m.applyFallbacks()
 	m.finalise()
+
+	// Sized from the theme's own part sizes, so the glyphs scale with the menu
+	// rather than with the label font.
+	m.checkFont = newMarlettFont(m.checkHeight)
+	m.submenuFont = newMarlettFont(m.submenuGlyph)
+
 	return m
 }
 
@@ -205,6 +261,7 @@ func (m *menuMetrics) applyThemeMetrics(hwnd w32.HWND, hdc w32.HDC) {
 	// The arrow's margins are part of that column.
 	if sz, ok := w32.GetThemePartSize(hTheme, hdc, w32.MENU_POPUPSUBMENU, w32.MSM_NORMAL, w32.TS_TRUE); ok {
 		m.submenuWidth = int(sz.CX)
+		m.submenuGlyph = int(sz.CY)
 	}
 	if mg, ok := w32.GetThemeMargins(hTheme, hdc, w32.MENU_POPUPSUBMENU, w32.MSM_NORMAL, w32.TMT_CONTENTMARGINS); ok {
 		m.submenuWidth += int(mg.CxLeftWidth + mg.CxRightWidth)
@@ -274,6 +331,9 @@ func (m *menuMetrics) applyFallbacks() {
 	if m.submenuWidth <= 0 {
 		m.submenuWidth = w32.SystemMetricForDpi(w32.SM_CXMENUSIZE, m.dpi)
 	}
+	if m.submenuGlyph <= 0 {
+		m.submenuGlyph = w32.SystemMetricForDpi(w32.SM_CYMENUSIZE, m.dpi)
+	}
 	if m.accelGap <= 0 {
 		m.accelGap = edgeX * accelGapChars
 	}
@@ -292,9 +352,11 @@ func (m *menuMetrics) release() {
 	if m == nil {
 		return
 	}
-	if m.font != 0 {
-		w32.DeleteObject(w32.HGDIOBJ(m.font))
-		m.font = 0
+	for _, f := range []*w32.HFONT{&m.font, &m.checkFont, &m.submenuFont} {
+		if *f != 0 {
+			w32.DeleteObject(w32.HGDIOBJ(*f))
+			*f = 0
+		}
 	}
 }
 
@@ -481,9 +543,9 @@ func (m *menuMetrics) drawCheck(hdc w32.HDC, rect w32.RECT, colours menuColours,
 		w32.DeleteObject(w32.HGDIOBJ(panelBrush))
 	}
 
-	glyph := "✓"
+	glyph := marlettCheck
 	if radio {
-		glyph = "●"
+		glyph = marlettBullet
 	}
 
 	previous := w32.SetTextColor(hdc, w32.COLORREF(colours.text))
@@ -492,7 +554,7 @@ func (m *menuMetrics) drawCheck(hdc w32.HDC, rect w32.RECT, colours menuColours,
 	} else if selected {
 		w32.SetTextColor(hdc, w32.COLORREF(colours.selectedText))
 	}
-	drawMenuString(hdc, glyph, &panel, w32.DT_CENTER|w32.DT_SINGLELINE|w32.DT_VCENTER)
+	drawSymbol(hdc, m.checkFont, glyph, panel)
 	w32.SetTextColor(hdc, previous)
 }
 
@@ -636,7 +698,7 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 		arrow := rect
 		arrow.Left = rect.Right - int32(metrics.itemPadRight+metrics.submenuWidth)
 		arrow.Right = rect.Right - int32(metrics.itemPadRight)
-		drawMenuString(dis.HDC, "▸", &arrow, w32.DT_CENTER|w32.DT_SINGLELINE|w32.DT_VCENTER)
+		drawSymbol(dis.HDC, metrics.submenuFont, marlettSubmenu, arrow)
 	} else if accel != "" {
 		// Drawn in the item's own text colour. Windows does not dim
 		// accelerators - using the disabled colour made them look disabled,
