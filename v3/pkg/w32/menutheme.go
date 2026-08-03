@@ -135,3 +135,32 @@ func DrawThemeBackground(hTheme HTHEME, hdc HDC, iPartId, iStateId int32, prc *R
 	// S_OK is 0.
 	return ret == 0
 }
+
+var procOpenThemeDataForDpi = uxtheme.NewProc("OpenThemeDataForDpi")
+
+// HasOpenThemeDataForDpiFunc reports whether the DPI-aware theme handle is
+// available. It shipped in Windows 10 1703.
+func HasOpenThemeDataForDpiFunc() bool {
+	return procOpenThemeDataForDpi.Find() == nil
+}
+
+// OpenThemeDataForDpi opens a theme whose metrics are expressed for dpi rather
+// than for the window's own.
+//
+// OpenThemeData returns part sizes that follow the display scaling but margins
+// that do not - they come back in 96-DPI units at every scaling factor, which
+// makes a menu laid out from them too tight at 200%. This is the documented way
+// to ask for metrics at a specific DPI.
+//
+// Returns 0 when unavailable or when the class has no theme.
+func OpenThemeDataForDpi(hwnd HWND, classList string, dpi UINT) HTHEME {
+	if procOpenThemeDataForDpi.Find() != nil {
+		return 0
+	}
+	ret, _, _ := procOpenThemeDataForDpi.Call(
+		uintptr(hwnd),
+		uintptr(unsafe.Pointer(MustStringToUTF16Ptr(classList))),
+		uintptr(dpi),
+	)
+	return HTHEME(ret)
+}

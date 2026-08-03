@@ -125,6 +125,9 @@ type menuMetrics struct {
 	minHeight      int
 	sepHeight      int
 
+	// labelReserveScaled is labelReserve in this DPI's units. See themeScale.
+	labelReserveScaled int
+
 	// themed records whether the measurements came from the visual style.
 	themed bool
 }
@@ -442,6 +445,61 @@ func (m *menuMetrics) applyThemeMetrics(hwnd w32.HWND, hdc w32.HDC) {
 	if sz, ok := w32.GetThemePartSize(hTheme, hdc, w32.MENU_POPUPSEPARATOR, 0, w32.TS_TRUE); ok {
 		m.sepRule = int(sz.CY)
 	}
+
+	// Everything the theme expresses in its own units has to be scaled to the
+	// artwork it is actually drawing with. GetThemePartSize follows the display
+	// scaling; GetThemeMargins does not - it answers in the units of the 96 DPI
+	// artwork whatever DPI is asked for, including through OpenThemeDataForDpi.
+	// Laying a menu out from both leaves every item several pixels too tight at
+	// 150% and 200%.
+	//
+	// The factor is how much the artwork grew, not dpi/96, and those differ. At
+	// 125% on Windows 10 the check part goes 16 to 18 and its margins genuinely
+	// stay at 6; at 150% on Windows 11 it goes 16 to 25 and they become 10; at
+	// 200% it goes 16 to 32 and they become 12. All measured against native
+	// popups.
+	// Only the vertical margins and the reserve. Scaling the horizontal ones
+	// too made every popup wider than native by exactly their contribution -
+	// 12px at 200%, being checkMarginX 6 to 12 and the item padding 3 to 6 on
+	// each side. Windows evidently applies the artwork scale down the item and
+	// not across it. Measured on Windows 11 at 150% and 200%.
+	scale := themeScale(hwnd, hdc, m.checkHeight)
+	m.checkMarginY = scale.apply(m.checkMarginY)
+	m.itemPadY = scale.apply(m.itemPadY)
+	m.labelReserveScaled = scale.apply(labelReserve)
+}
+
+// themeRatio is the factor between the artwork the theme draws with and the
+// artwork its margins are expressed in. Kept as a fraction rather than a float
+// so the arithmetic is exact and truncates the way the measurements did.
+type themeRatio struct{ have, base int }
+
+func (r themeRatio) apply(v int) int {
+	if r.base <= 0 {
+		return v
+	}
+	return v * r.have / r.base
+}
+
+// themeScale measures that factor by asking for the same part at 96 DPI.
+// OpenThemeDataForDpi reports 96 DPI sizes reliably even from a scaled window,
+// which is what makes it usable as a reference - it is only its margins that
+// ignore the request.
+//
+// Returns 1:1 when the DPI-aware entry point is missing, leaving the metrics as
+// the theme reported them.
+func themeScale(hwnd w32.HWND, hdc w32.HDC, have int) themeRatio {
+	base := w32.OpenThemeDataForDpi(hwnd, "Menu", w32.USER_DEFAULT_SCREEN_DPI)
+	if base == 0 {
+		return themeRatio{1, 1}
+	}
+	defer w32.CloseThemeData(base)
+
+	sz, ok := w32.GetThemePartSize(base, hdc, w32.MENU_POPUPCHECK, w32.MC_CHECKMARKNORMAL, w32.TS_TRUE)
+	if !ok || sz.CY <= 0 {
+		return themeRatio{1, 1}
+	}
+	return themeRatio{have, int(sz.CY)}
 }
 
 // applyFontMetrics records what depends on the menu font. hdc must already have
@@ -511,6 +569,14 @@ func (m *menuMetrics) applyFallbacks() {
 	if m.sepRule <= 0 {
 		m.sepRule = 2*w32.SystemMetricForDpi(w32.SM_CYBORDER, m.dpi) + 1
 	}
+}
+
+// reserve is labelReserve in this DPI's units.
+func (m *menuMetrics) reserve() int {
+	if m.labelReserveScaled > 0 {
+		return m.labelReserveScaled
+	}
+	return labelReserve
 }
 
 // textLeft is where an item's label starts.
@@ -774,7 +840,7 @@ func (w *windowsWebviewWindow) handleMeasureMenuItem(lparam uintptr) bool {
 	// labelReserve goes on unconditionally - Windows keeps it whether or not
 	// there is an accelerator to put in it, so a popup with none is otherwise
 	// too narrow by exactly that much.
-	width := metrics.textLeft() + labelW + metrics.itemPadRight + metrics.submenuWidth + labelReserve
+	width := metrics.textLeft() + labelW + metrics.itemPadRight + metrics.submenuWidth + metrics.reserve()
 	if accelW > 0 {
 		width += accelW
 	}
