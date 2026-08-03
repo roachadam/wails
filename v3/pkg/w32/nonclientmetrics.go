@@ -40,7 +40,11 @@ type NONCLIENTMETRICS struct {
 	PaddedBorderWidth int32
 }
 
-var procSystemParametersInfoForDpi = moduser32.NewProc("SystemParametersInfoForDpiW")
+// Unlike SystemParametersInfo, this one has no A/W pair - it takes the struct
+// through a void* and user32 exports the single unsuffixed name. Asking for
+// SystemParametersInfoForDpiW finds nothing on any build, which silently sends
+// every caller down the unscaled fallback below.
+var procSystemParametersInfoForDpi = moduser32.NewProc("SystemParametersInfoForDpi")
 
 // HasSystemParametersInfoForDpiFunc reports whether the DPI-aware variant is
 // available. It shipped in Windows 10 1607; on older builds callers fall back to
