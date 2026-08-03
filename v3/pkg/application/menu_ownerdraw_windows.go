@@ -114,7 +114,6 @@ type menuMetrics struct {
 	// without the margins that make up the rest of that column.
 	submenuWidth int
 	submenuGlyph int
-	accelGap     int
 	minHeight    int
 	sepHeight    int
 
@@ -122,9 +121,23 @@ type menuMetrics struct {
 	themed bool
 }
 
-// accelGapChars is the space between a label and its accelerator, in average
-// character widths of the menu font. The theme has no property for it.
-const accelGapChars = 4
+// labelReserve is the space Windows keeps to the right of every popup label,
+// before the submenu column.
+//
+// Windows adds no gap of its own between a label and its accelerator: a native
+// item with an accelerator is exactly as wide as the same item without one plus
+// the accelerator's text. The separation comes from this reserve, which is
+// present on every item whether or not it has an accelerator, and on submenu
+// items too.
+//
+// It is a constant. Measured against native popups on build 19045 it stayed at
+// 27 across DPI 96 and 120 and menu fonts of -12, -15 and -18, so it follows
+// neither the display scaling nor the font, and no theme part or system metric
+// available here evaluates to it at both DPIs - gutterWidth+SM_CXEDGE and
+// submenuWidth+submenuGlyph both give 27 at 96 DPI and neither does at 120.
+// Deriving it would mean inventing a formula that happens to fit, so it is
+// recorded as what it is.
+const labelReserve = 27
 
 // Marlett is the symbol font Windows draws menu glyphs from. Being a font it
 // renders in whatever text colour is set, which is why it can supply Windows'
@@ -280,7 +293,6 @@ func (m *menuMetrics) applyFontMetrics(hdc w32.HDC) {
 		return
 	}
 	m.textHeight = int(tm.TmHeight + tm.TmExternalLeading)
-	m.accelGap = int(tm.TmAveCharWidth) * accelGapChars
 }
 
 // finalise combines the theme and font measurements into the layout.
@@ -333,9 +345,6 @@ func (m *menuMetrics) applyFallbacks() {
 	}
 	if m.submenuGlyph <= 0 {
 		m.submenuGlyph = w32.SystemMetricForDpi(w32.SM_CYMENUSIZE, m.dpi)
-	}
-	if m.accelGap <= 0 {
-		m.accelGap = edgeX * accelGapChars
 	}
 	if m.textHeight <= 0 {
 		m.textHeight = w32.SystemMetricForDpi(w32.SM_CYMENU, m.dpi)
@@ -603,9 +612,12 @@ func (w *windowsWebviewWindow) handleMeasureMenuItem(lparam uintptr) bool {
 
 	// The submenu column is likewise reserved on every item, so an arrow can
 	// never be drawn over a label that was measured without it.
-	width := metrics.textLeft() + labelW + metrics.itemPadRight + metrics.submenuWidth
+	// labelReserve goes on unconditionally - Windows keeps it whether or not
+	// there is an accelerator to put in it, so a popup with none is otherwise
+	// too narrow by exactly that much.
+	width := metrics.textLeft() + labelW + metrics.itemPadRight + metrics.submenuWidth + labelReserve
 	if accelW > 0 {
-		width += metrics.accelGap + accelW
+		width += accelW
 	}
 	height := max(labelH+metrics.itemPadY, metrics.minHeight)
 
