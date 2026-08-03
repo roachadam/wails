@@ -92,8 +92,14 @@ type menuMetrics struct {
 	// checkFont and submenuFont are Marlett at the sizes the theme reports for
 	// the checkmark and the submenu arrow. Two fonts because those parts are
 	// different sizes - 16px and 9px on the stock style.
+	// Each glyph carries its own font and character, because the icon font and
+	// the Marlett fallback use different codepoints and either may be in use.
 	checkFont   w32.HFONT
+	checkChar   string
+	bulletFont  w32.HFONT
+	bulletChar  string
 	submenuFont w32.HFONT
+	submenuChar string
 
 	// Raw measurements, combined by finalise.
 	checkWidth   int // MENU_POPUPCHECK size
@@ -112,10 +118,12 @@ type menuMetrics struct {
 	// submenuWidth is reserved on the right of every item, as Windows does, so
 	// the arrow never overlaps a long label. submenuGlyph is the arrow itself,
 	// without the margins that make up the rest of that column.
-	submenuWidth int
-	submenuGlyph int
-	minHeight    int
-	sepHeight    int
+	submenuWidth   int
+	submenuGlyph   int
+	submenuGlyphW  int
+	submenuMarginY int
+	minHeight      int
+	sepHeight      int
 
 	// themed records whether the measurements came from the visual style.
 	themed bool
@@ -152,6 +160,129 @@ const (
 	marlettBullet  = "h" // 0x68, filled dot for a radio item
 	marlettSubmenu = "8" // 0x38, small right-pointing triangle
 )
+
+// Segoe MDL2 Assets is the icon font Windows 10 draws its own menu glyphs from.
+// They are different shapes from Marlett's, not the same shapes at another
+// size: a two-stroke chevron rather than a solid triangle, and a lighter check.
+// Resizing Marlett was never going to match them.
+//
+// The codes were picked off a rendering of the font's E7xx block rather than
+// recalled.
+const (
+	iconFace         = "Segoe MDL2 Assets"
+	iconCheck        = "\ue73e" // CheckMark
+	iconBullet       = "\ue7c8" // filled dot for a radio item
+	iconChevronRight = "\ue76c" // ChevronRight, the submenu arrow
+)
+
+// newGlyphFont builds the icon font at the given size, falling back to Marlett
+// when it cannot draw the character.
+//
+// The check has to be for the glyph, not the typeface. GDI reports back
+// whatever face name was requested, so comparing names says nothing, and a font
+// that exists but lacks the codepoint draws a missing-glyph box - which reads as
+// a bug rather than a fallback.
+func newGlyphFont(hwnd w32.HWND, height int, icon, marlett string) (w32.HFONT, string) {
+	if font := newIconFont(height); font != 0 {
+		if fontCanDraw(hwnd, font, icon) {
+			return font, icon
+		}
+		w32.DeleteObject(w32.HGDIOBJ(font))
+	}
+	return newMarlettFont(height), marlett
+}
+
+// iconFontForInk builds the icon font at whatever size makes glyph's ink about
+// target pixels tall.
+//
+// Sizing by the em box undershoots: an icon font pads its glyphs inside the em,
+// so a font of height N draws an outline noticeably smaller than N. For the
+// submenu arrow, whose part is only nine pixels at 96 DPI to begin with, that
+// difference is the whole character - it comes out thin and grey where Windows'
+// is solid.
+//
+// Falls back to sizing by the em box when the glyph cannot be measured.
+func iconFontForInk(hwnd w32.HWND, glyph string, target int) w32.HFONT {
+	if target <= 0 || glyph == "" {
+		return 0
+	}
+
+	// Large enough that the ink height is a precise ratio rather than a handful
+	// of pixels rounded to nothing.
+	const probeEm = 64
+
+	em := target
+	if probe := newIconFont(probeEm); probe != 0 {
+		if ink := glyphInk(hwnd, probe, glyph); ink > 0 {
+			// Round to nearest rather than truncating: at these sizes one pixel
+			// is a visible fraction of the glyph.
+			em = (probeEm*target*2/ink + 1) / 2
+		}
+		w32.DeleteObject(w32.HGDIOBJ(probe))
+	}
+	return newIconFont(em)
+}
+
+func glyphInk(hwnd w32.HWND, font w32.HFONT, glyph string) int {
+	hdc := w32.GetDC(hwnd)
+	if hdc == 0 {
+		return 0
+	}
+	defer w32.ReleaseDC(hwnd, hdc)
+
+	old := w32.SelectObject(hdc, w32.HGDIOBJ(font))
+	ink := w32.GlyphInkHeight(hdc, []rune(glyph)[0])
+	if old != 0 {
+		w32.SelectObject(hdc, old)
+	}
+	return ink
+}
+
+// contentBox is a themed part less its own margins, floored so a part that
+// reports margins as large as itself still yields something drawable.
+func contentBox(size, margin int) int {
+	if inner := size - margin; inner > 0 {
+		return inner
+	}
+	return size
+}
+
+// newIconFont builds Segoe MDL2 Assets at the given cell height. Unlike Marlett
+// it is a normal-charset font whose glyphs fill their box, so the theme's part
+// size is the right height to ask for.
+func newIconFont(height int) w32.HFONT {
+	if height <= 0 {
+		return 0
+	}
+	lf := w32.LOGFONT{
+		// Negative: match the character height rather than the cell height. A
+		// positive value has the font mapper include internal leading, so the
+		// glyph lands well under the requested size - which for an icon font,
+		// whose glyphs are drawn to fill their em box, means it never reaches
+		// the size the layout reserved for it.
+		Height:  -int32(height),
+		Weight:  400, // FW_NORMAL
+		CharSet: 1,   // DEFAULT_CHARSET
+		Quality: 5,   // CLEARTYPE_QUALITY
+	}
+	copy(lf.FaceName[:], w32.MustStringToUTF16(iconFace))
+	return w32.CreateFontIndirect(&lf)
+}
+
+func fontCanDraw(hwnd w32.HWND, font w32.HFONT, s string) bool {
+	hdc := w32.GetDC(hwnd)
+	if hdc == 0 {
+		return false
+	}
+	defer w32.ReleaseDC(hwnd, hdc)
+
+	old := w32.SelectObject(hdc, w32.HGDIOBJ(font))
+	ok := w32.FontHasGlyphs(hdc, s)
+	if old != 0 {
+		w32.SelectObject(hdc, old)
+	}
+	return ok
+}
 
 // newMarlettFont builds Marlett at the given cell height. SYMBOL_CHARSET
 // matters: Marlett has no ANSI mapping, and requesting the wrong charset gets a
@@ -226,8 +357,34 @@ func newMenuMetrics(hwnd w32.HWND) *menuMetrics {
 
 	// Sized from the theme's own part sizes, so the glyphs scale with the menu
 	// rather than with the label font.
-	m.checkFont = newMarlettFont(m.checkHeight)
-	m.submenuFont = newMarlettFont(m.submenuGlyph)
+	// Sized to the part's content box - the part less its own margins - rather
+	// than to the part. The theme pads its artwork, so the ink inside a 16px
+	// checkmark part is nearer 10px, and an icon glyph drawn at the full 16
+	// comes out visibly larger than the one Windows draws. The submenu part is
+	// barely padded, so its arrow gets close to the full size instead.
+	m.checkFont, m.checkChar = newGlyphFont(hwnd, contentBox(m.checkHeight, m.checkMarginY), iconCheck, marlettCheck)
+	m.bulletFont, m.bulletChar = newGlyphFont(hwnd, contentBox(m.checkHeight, m.checkMarginY), iconBullet, marlettBullet)
+	// The arrow is sized by its ink rather than by the em box. Its part carries
+	// almost no margin, so the target is the part itself, and at nine pixels the
+	// shortfall from em-box sizing is most of the glyph. The check and the
+	// bullet keep em-box sizing: their part's margins already describe the
+	// padding, so subtracting them lands in the right place.
+	// The target is the height of the artwork Windows actually draws, measured
+	// rather than assumed: the part's box is taller than the chevron inside it,
+	// so sizing to the box overshoots. Falls back to the box when the part
+	// cannot be measured, which is the case without a visual style.
+	arrowInk := themedInkHeight(hwnd, w32.MENU_POPUPSUBMENU, w32.MSM_NORMAL, m.submenuGlyphW, m.submenuGlyph)
+	if arrowInk <= 0 {
+		arrowInk = contentBox(m.submenuGlyph, m.submenuMarginY)
+	}
+	if font := iconFontForInk(hwnd, iconChevronRight, arrowInk); font != 0 && fontCanDraw(hwnd, font, iconChevronRight) {
+		m.submenuFont, m.submenuChar = font, iconChevronRight
+	} else {
+		if font != 0 {
+			w32.DeleteObject(w32.HGDIOBJ(font))
+		}
+		m.submenuFont, m.submenuChar = newMarlettFont(m.submenuGlyph), marlettSubmenu
+	}
 
 	return m
 }
@@ -274,10 +431,12 @@ func (m *menuMetrics) applyThemeMetrics(hwnd w32.HWND, hdc w32.HDC) {
 	// The arrow's margins are part of that column.
 	if sz, ok := w32.GetThemePartSize(hTheme, hdc, w32.MENU_POPUPSUBMENU, w32.MSM_NORMAL, w32.TS_TRUE); ok {
 		m.submenuWidth = int(sz.CX)
+		m.submenuGlyphW = int(sz.CX)
 		m.submenuGlyph = int(sz.CY)
 	}
 	if mg, ok := w32.GetThemeMargins(hTheme, hdc, w32.MENU_POPUPSUBMENU, w32.MSM_NORMAL, w32.TMT_CONTENTMARGINS); ok {
 		m.submenuWidth += int(mg.CxLeftWidth + mg.CxRightWidth)
+		m.submenuMarginY = int(mg.CyTopHeight + mg.CyBottomHeight)
 	}
 
 	if sz, ok := w32.GetThemePartSize(hTheme, hdc, w32.MENU_POPUPSEPARATOR, 0, w32.TS_TRUE); ok {
@@ -361,7 +520,7 @@ func (m *menuMetrics) release() {
 	if m == nil {
 		return
 	}
-	for _, f := range []*w32.HFONT{&m.font, &m.checkFont, &m.submenuFont} {
+	for _, f := range []*w32.HFONT{&m.font, &m.checkFont, &m.bulletFont, &m.submenuFont} {
 		if *f != 0 {
 			w32.DeleteObject(w32.HGDIOBJ(*f))
 			*f = 0
@@ -552,9 +711,9 @@ func (m *menuMetrics) drawCheck(hdc w32.HDC, rect w32.RECT, colours menuColours,
 		w32.DeleteObject(w32.HGDIOBJ(panelBrush))
 	}
 
-	glyph := marlettCheck
+	font, glyph := m.checkFont, m.checkChar
 	if radio {
-		glyph = marlettBullet
+		font, glyph = m.bulletFont, m.bulletChar
 	}
 
 	previous := w32.SetTextColor(hdc, w32.COLORREF(colours.text))
@@ -563,7 +722,7 @@ func (m *menuMetrics) drawCheck(hdc w32.HDC, rect w32.RECT, colours menuColours,
 	} else if selected {
 		w32.SetTextColor(hdc, w32.COLORREF(colours.selectedText))
 	}
-	drawSymbol(hdc, m.checkFont, glyph, panel)
+	drawSymbol(hdc, font, glyph, panel)
 	w32.SetTextColor(hdc, previous)
 }
 
@@ -704,14 +863,22 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 	labelRect.Right -= int32(metrics.itemPadRight + metrics.submenuWidth)
 	drawMenuString(dis.HDC, label, &labelRect, w32.DT_LEFT|w32.DT_SINGLELINE|w32.DT_VCENTER)
 
-	if hasSubmenu {
-		// Drawn inside the column reserved for it in handleMeasureMenuItem, so
-		// it cannot land on top of a long label.
-		arrow := rect
-		arrow.Left = rect.Right - int32(metrics.itemPadRight+metrics.submenuWidth)
-		arrow.Right = rect.Right - int32(metrics.itemPadRight)
-		drawSymbol(dis.HDC, metrics.submenuFont, marlettSubmenu, arrow)
-	} else if accel != "" {
+	// No arrow is drawn here. Windows draws the submenu arrow itself, after
+	// WM_DRAWITEM returns, so anything painted in that column is covered a
+	// moment later - verified by deleting this drawing entirely and watching the
+	// arrow still appear. It uses the classic DFCS_MENUARROW triangle rather
+	// than the theme's chevron because owner-draw bypasses the themed path,
+	// which is a difference from a native popup that owner-draw cannot close.
+	//
+	// The column is still reserved in handleMeasureMenuItem, because Windows
+	// reserves it too and the widths only match native when it is.
+	//
+	// What can be controlled is its colour: the arrow is a monochrome bitmap
+	// blit, which takes the device context's text colour. Leaving that set to
+	// the item's ink rather than restoring it is what stops the arrow coming out
+	// in the system's menu text colour - dark, and close to invisible, on a dark
+	// background.
+	if !hasSubmenu && accel != "" {
 		// Drawn in the item's own text colour. Windows does not dim
 		// accelerators - using the disabled colour made them look disabled,
 		// which is obvious under a High Contrast scheme where that colour is
@@ -720,7 +887,9 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 		drawMenuString(dis.HDC, accel, &accelRect, w32.DT_RIGHT|w32.DT_SINGLELINE|w32.DT_VCENTER)
 	}
 
-	w32.SetTextColor(dis.HDC, oldTextColour)
+	if !hasSubmenu {
+		w32.SetTextColor(dis.HDC, oldTextColour)
+	}
 	w32.SetBkMode(dis.HDC, oldBkMode)
 	if oldFont != 0 {
 		w32.SelectObject(dis.HDC, oldFont)

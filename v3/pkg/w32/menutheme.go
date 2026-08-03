@@ -47,6 +47,11 @@ const (
 	MSM_DISABLED = 2
 )
 
+// MN_GETHMENU asks an open menu's window - class #32768 - for the HMENU it is
+// displaying. It is the only way to reach a popup's handle from outside the
+// menu loop.
+const MN_GETHMENU = 0x01E1
+
 // THEMESIZE values for GetThemePartSize.
 const (
 	TS_MIN  = 0 // minimum size
@@ -110,4 +115,23 @@ func GetThemeMargins(hTheme HTHEME, hdc HDC, iPartId, iStateId, iPropId int32) (
 		return MARGINS{}, false
 	}
 	return m, true
+}
+
+// DrawThemeBackground paints a themed part into hdc.
+//
+// It paints in the visual style's own colours, so it cannot be used to draw a
+// menu glyph that has to follow wails' palette. It is still the only way to see
+// what the visual style would have drawn, which is what sizing a replacement
+// glyph correctly depends on.
+func DrawThemeBackground(hTheme HTHEME, hdc HDC, iPartId, iStateId int32, prc *RECT) bool {
+	ret, _, _ := procDrawThemeBackground.Call(
+		uintptr(hTheme),
+		uintptr(hdc),
+		uintptr(iPartId),
+		uintptr(iStateId),
+		uintptr(unsafe.Pointer(prc)),
+		0, // prcClip: NULL
+	)
+	// S_OK is 0.
+	return ret == 0
 }

@@ -1615,6 +1615,16 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 		if w.handleDrawMenuItem(lparam) {
 			return 1
 		}
+	case w32.WM_ENTERIDLE:
+		// The first sight of a popup's window handle, which is what makes this
+		// the place to take over its painting. See paintSubmenuArrows.
+		if wparam == MSGF_MENU {
+			popup := w32.HWND(lparam)
+			w.subclassPopup(popup)
+			w.paintSubmenuArrows(popup)
+		}
+	case w32.WM_EXITMENULOOP:
+		releasePopups()
 	}
 
 	// Use the original implementation that works perfectly for maximized
