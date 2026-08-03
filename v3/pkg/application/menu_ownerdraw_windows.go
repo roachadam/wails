@@ -86,22 +86,26 @@ type menuMetrics struct {
 
 	font w32.HFONT
 
-	// gutterWidth is the checkmark column: the check background plus the
-	// gutter that separates it from the label.
-	gutterWidth int
-	// checkWidth and checkHeight size the checkmark within the gutter.
-	checkWidth  int
-	checkHeight int
-	// itemPadLeft and itemPadRight are the content margins of a popup item.
-	itemPadLeft  int
+	// Raw measurements, combined by finalise.
+	checkWidth   int // MENU_POPUPCHECK size
+	checkHeight  int
+	checkMarginX int // MENU_POPUPCHECK content margins, the padding around the glyph
+	checkMarginY int
+	gutterGap    int // MENU_POPUPGUTTER width, between the check column and the label
+	itemPadLeft  int // MENU_POPUPITEM content margins
 	itemPadRight int
+	itemPadY     int
+	sepRule      int // MENU_POPUPSEPARATOR height
+	textHeight   int // from the menu font
+
+	// Derived layout.
+	gutterWidth int
 	// submenuWidth is reserved on the right of every item, as Windows does, so
 	// the arrow never overlaps a long label.
 	submenuWidth int
-
-	accelGap  int
-	minHeight int
-	sepHeight int
+	accelGap     int
+	minHeight    int
+	sepHeight    int
 
 	// themed records whether the measurements came from the visual style.
 	themed bool
@@ -151,11 +155,17 @@ func newMenuMetrics(hwnd w32.HWND) *menuMetrics {
 	}
 
 	m.applyFallbacks()
+	m.finalise()
 	return m
 }
 
-// applyThemeMetrics fills in the geometry the visual style defines. It leaves
-// the fields at zero when the theme is unavailable, for applyFallbacks to cover.
+// applyThemeMetrics reads the raw geometry the visual style defines. The values
+// are combined in finalise, because the item height depends on the text height
+// too and that is not known until the font has been measured.
+//
+// Every formula below was checked against a native popup on build 17763, read
+// back with GetMenuItemRect rather than estimated: item height 22, separator 7,
+// with a 15px menu font.
 func (m *menuMetrics) applyThemeMetrics(hwnd w32.HWND, hdc w32.HDC) {
 	hTheme := w32.OpenThemeData(hwnd, "Menu")
 	if hTheme == 0 {
@@ -168,58 +178,61 @@ func (m *menuMetrics) applyThemeMetrics(hwnd w32.HWND, hdc w32.HDC) {
 	if sz, ok := w32.GetThemePartSize(hTheme, hdc, w32.MENU_POPUPCHECK, w32.MC_CHECKMARKNORMAL, w32.TS_TRUE); ok {
 		m.checkWidth, m.checkHeight = int(sz.CX), int(sz.CY)
 	}
+	// The checkmark's own margins are the padding around the glyph - (3,3,3,3)
+	// on the stock style. MENU_POPUPCHECKBACKGROUND's margins are not: they are
+	// (0,6,0,0), so reading the vertical padding from there yields zero and the
+	// rows come out too short.
+	if mg, ok := w32.GetThemeMargins(hTheme, hdc, w32.MENU_POPUPCHECK, w32.MC_CHECKMARKNORMAL, w32.TMT_CONTENTMARGINS); ok {
+		m.checkMarginX = int(mg.CxLeftWidth + mg.CxRightWidth)
+		m.checkMarginY = int(mg.CyTopHeight + mg.CyBottomHeight)
+	}
 
-	// The gutter is the checkmark plus the background it sits in plus the
-	// divider column, which together are what separates a label from the left
-	// edge of the popup. This is the measurement SM_CXMENUCHECK is not.
-	gutter := m.checkWidth
-	if mg, ok := w32.GetThemeMargins(hTheme, hdc, w32.MENU_POPUPCHECKBACKGROUND, w32.MCB_NORMAL, w32.TMT_CONTENTMARGINS); ok {
-		gutter += int(mg.CxLeftWidth + mg.CxRightWidth)
-		m.minHeight = max(m.minHeight, m.checkHeight+int(mg.CyTopHeight+mg.CyBottomHeight))
-	}
 	if sz, ok := w32.GetThemePartSize(hTheme, hdc, w32.MENU_POPUPGUTTER, 0, w32.TS_TRUE); ok {
-		gutter += int(sz.CX)
+		m.gutterGap = int(sz.CX)
 	}
-	m.gutterWidth = gutter
 
 	if mg, ok := w32.GetThemeMargins(hTheme, hdc, w32.MENU_POPUPITEM, w32.MPI_NORMAL, w32.TMT_CONTENTMARGINS); ok {
 		m.itemPadLeft, m.itemPadRight = int(mg.CxLeftWidth), int(mg.CxRightWidth)
-		m.minHeight = max(m.minHeight, int(mg.CyTopHeight+mg.CyBottomHeight))
+		m.itemPadY = int(mg.CyTopHeight + mg.CyBottomHeight)
 	}
 
 	// Windows reserves the submenu column on every item, not just the ones with
 	// a submenu, which is why a native popup is wider than its longest label.
+	// The arrow's margins are part of that column.
 	if sz, ok := w32.GetThemePartSize(hTheme, hdc, w32.MENU_POPUPSUBMENU, w32.MSM_NORMAL, w32.TS_TRUE); ok {
 		m.submenuWidth = int(sz.CX)
 	}
+	if mg, ok := w32.GetThemeMargins(hTheme, hdc, w32.MENU_POPUPSUBMENU, w32.MSM_NORMAL, w32.TMT_CONTENTMARGINS); ok {
+		m.submenuWidth += int(mg.CxLeftWidth + mg.CxRightWidth)
+	}
 
 	if sz, ok := w32.GetThemePartSize(hTheme, hdc, w32.MENU_POPUPSEPARATOR, 0, w32.TS_TRUE); ok {
-		m.sepHeight = int(sz.CY)
+		m.sepRule = int(sz.CY)
 	}
 }
 
-// applyFontMetrics fills in the values that depend on the menu font rather than
-// on the theme. hdc must already have the menu font selected.
+// applyFontMetrics records what depends on the menu font. hdc must already have
+// that font selected.
 func (m *menuMetrics) applyFontMetrics(hdc w32.HDC) {
 	var tm w32.TEXTMETRIC
 	if !w32.GetTextMetrics(hdc, &tm) {
 		return
 	}
+	m.textHeight = int(tm.TmHeight + tm.TmExternalLeading)
 	m.accelGap = int(tm.TmAveCharWidth) * accelGapChars
-
-	// An item is at least tall enough for its text plus the item's vertical
-	// content margins, which applyThemeMetrics has already folded into
-	// minHeight.
-	m.minHeight = max(m.minHeight, int(tm.TmHeight+tm.TmExternalLeading)+m.verticalPadding())
 }
 
-// verticalPadding is the space above and below an item's text. The theme's item
-// margins cover it when themed; otherwise fall back to the classic edge metric.
-func (m *menuMetrics) verticalPadding() int {
-	if m.themed {
-		return 0
-	}
-	return 2 * w32.SystemMetricForDpi(w32.SM_CYEDGE, m.dpi)
+// finalise combines the theme and font measurements into the layout.
+//
+//	gutter      = check + its margins + the gutter column
+//	item height = the taller of the checkmark block and the text block
+//	separator   = the rule plus the item's vertical padding
+//
+// On build 17763 that gives 22 and 7, matching the native menu exactly.
+func (m *menuMetrics) finalise() {
+	m.gutterWidth = m.checkWidth + m.checkMarginX + m.gutterGap
+	m.minHeight = max(m.checkHeight+m.checkMarginY, m.textHeight+m.itemPadY)
+	m.sepHeight = m.sepRule + m.itemPadY
 }
 
 // applyFallbacks covers the classic style, High Contrast, and the case where the
@@ -227,31 +240,45 @@ func (m *menuMetrics) verticalPadding() int {
 // metric rather than a fixed pixel count, so it still follows display scaling -
 // it is simply the classic geometry rather than the themed geometry.
 func (m *menuMetrics) applyFallbacks() {
+	edgeX := w32.SystemMetricForDpi(w32.SM_CXEDGE, m.dpi)
+	edgeY := w32.SystemMetricForDpi(w32.SM_CYEDGE, m.dpi)
+
 	if m.checkWidth <= 0 {
 		m.checkWidth = w32.SystemMetricForDpi(w32.SM_CXMENUCHECK, m.dpi)
 	}
 	if m.checkHeight <= 0 {
 		m.checkHeight = w32.SystemMetricForDpi(w32.SM_CYMENUCHECK, m.dpi)
 	}
-	if m.itemPadLeft <= 0 {
-		m.itemPadLeft = w32.SystemMetricForDpi(w32.SM_CXEDGE, m.dpi)
+	if m.checkMarginX <= 0 {
+		m.checkMarginX = 2 * edgeX
 	}
-	if m.itemPadRight <= 0 {
-		m.itemPadRight = m.itemPadLeft
+	if m.checkMarginY <= 0 {
+		m.checkMarginY = 2 * edgeY
 	}
-	if m.gutterWidth <= 0 {
-		m.gutterWidth = m.checkWidth + 2*m.itemPadLeft
+	if m.gutterGap <= 0 {
+		m.gutterGap = edgeX
+	}
+	if m.itemPadLeft <= 0 && !m.themed {
+		m.itemPadLeft = edgeX
+	}
+	if m.itemPadRight <= 0 && !m.themed {
+		m.itemPadRight = edgeX
+	}
+	if m.itemPadY <= 0 && !m.themed {
+		m.itemPadY = 2 * edgeY
 	}
 	if m.submenuWidth <= 0 {
 		m.submenuWidth = w32.SystemMetricForDpi(w32.SM_CXMENUSIZE, m.dpi)
 	}
 	if m.accelGap <= 0 {
-		m.accelGap = m.itemPadLeft * accelGapChars
+		m.accelGap = edgeX * accelGapChars
 	}
-	if m.minHeight <= 0 {
-		m.minHeight = w32.SystemMetricForDpi(w32.SM_CYMENU, m.dpi)
+	if m.textHeight <= 0 {
+		m.textHeight = w32.SystemMetricForDpi(w32.SM_CYMENU, m.dpi)
 	}
-	m.sepHeight = max(m.sepHeight, 2*w32.SystemMetricForDpi(w32.SM_CYBORDER, m.dpi)+1)
+	if m.sepRule <= 0 {
+		m.sepRule = 2*w32.SystemMetricForDpi(w32.SM_CYBORDER, m.dpi) + 1
+	}
 }
 
 // textLeft is where an item's label starts.
@@ -430,7 +457,7 @@ func (w *windowsWebviewWindow) handleMeasureMenuItem(lparam uintptr) bool {
 	if accelW > 0 {
 		width += metrics.accelGap + accelW
 	}
-	height := max(labelH+metrics.verticalPadding(), metrics.minHeight)
+	height := max(labelH+metrics.itemPadY, metrics.minHeight)
 
 	mis.ItemWidth = uint32(width)
 	mis.ItemHeight = uint32(height)
