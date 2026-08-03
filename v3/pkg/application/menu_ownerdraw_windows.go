@@ -27,12 +27,16 @@ import (
 // menuMetrics.
 
 type menuColours struct {
-	background   uint32
-	text         uint32
-	disabledText uint32
-	selectedBg   uint32
-	selectedText uint32
-	separator    uint32
+	background uint32
+	text       uint32
+	// checkBackground is the panel behind a checkmark, which Windows draws as
+	// MENU_POPUPCHECKBACKGROUND. Without it a checked item is much harder to
+	// pick out.
+	checkBackground uint32
+	disabledText    uint32
+	selectedBg      uint32
+	selectedText    uint32
+	separator       uint32
 }
 
 // rgb packs a colour to COLORREF byte order (0x00BBGGRR).
@@ -41,52 +45,70 @@ func rgb(r, g, b uint32) uint32 {
 }
 
 var darkMenuColours = menuColours{
-	background:   rgb(33, 33, 33),
-	text:         rgb(222, 222, 222),
-	disabledText: rgb(110, 110, 110),
-	selectedBg:   rgb(62, 62, 64),
-	selectedText: rgb(255, 255, 255),
-	separator:    rgb(60, 60, 60),
+	background:      rgb(33, 33, 33),
+	text:            rgb(222, 222, 222),
+	checkBackground: rgb(62, 62, 64),
+	disabledText:    rgb(110, 110, 110),
+	selectedBg:      rgb(62, 62, 64),
+	selectedText:    rgb(255, 255, 255),
+	separator:       rgb(60, 60, 60),
 }
 
 var lightMenuColours = menuColours{
-	background:   rgb(255, 255, 255),
-	text:         rgb(0, 0, 0),
-	disabledText: rgb(109, 109, 109),
-	selectedBg:   rgb(204, 232, 255),
-	selectedText: rgb(0, 0, 0),
-	separator:    rgb(215, 215, 215),
+	background:      rgb(255, 255, 255),
+	text:            rgb(0, 0, 0),
+	checkBackground: rgb(204, 232, 255),
+	disabledText:    rgb(109, 109, 109),
+	selectedBg:      rgb(204, 232, 255),
+	selectedText:    rgb(0, 0, 0),
+	separator:       rgb(215, 215, 215),
 }
 
-// menuMetrics holds the layout for one DPI. Nothing here is a fixed pixel
-// count: the values come from the user's menu font and the system metrics for
-// the window's DPI, so items follow the display scaling and any font size the
-// user has chosen in Windows.
+// menuMetrics holds the layout for one DPI.
 //
-// Sources:
+// Geometry comes from the Menu visual style, not from GetSystemMetrics.
+// GetSystemMetrics returns the classic pre-theme values - SM_CXMENUCHECK, for
+// instance, is the size of the old checkmark bitmap, not the width of the gutter
+// a themed menu reserves - and using them produces a menu that is uniformly
+// tighter and narrower than the real thing. GetThemePartSize and
+// GetThemeMargins on the "Menu" class return what Windows actually draws with.
 //
-//   - font comes from NONCLIENTMETRICS.MenuFont, which is the font Windows
-//     itself uses for menus, already scaled for the requested DPI.
-//   - checkGutter comes from SM_CXMENUCHECK, the width Windows reserves for a
-//     menu checkmark.
-//   - minHeight has SM_CYMENUCHECK as its floor so a checkmark always fits, and
-//     otherwise follows the text height.
-//   - paddingX, accelGap and separatorHeight have no system metric of their own.
-//     They are expressed as multiples of the font's average character width and
-//     line height, so they scale with the font instead of being fixed pixels.
+// The theme supplies the measurements only. The pixels are still ours, because
+// the entire purpose of owner-drawing here is to override the colours: calling
+// DrawThemeBackground for the checkmark or the submenu arrow would paint them in
+// the system theme's colours, which on a light system means a dark glyph on our
+// dark background - the very bug being fixed.
+//
+// Every value falls back to a DPI-scaled system metric when the theme is
+// unavailable, which is the case under the classic style and in High Contrast.
 type menuMetrics struct {
 	dpi w32.UINT
 
-	font        w32.HFONT
-	checkGutter int
-	paddingX    int
-	accelGap    int
-	minHeight   int
-	sepHeight   int
+	font w32.HFONT
+
+	// gutterWidth is the checkmark column: the check background plus the
+	// gutter that separates it from the label.
+	gutterWidth int
+	// checkWidth and checkHeight size the checkmark within the gutter.
+	checkWidth  int
+	checkHeight int
+	// itemPadLeft and itemPadRight are the content margins of a popup item.
+	itemPadLeft  int
+	itemPadRight int
+	// submenuWidth is reserved on the right of every item, as Windows does, so
+	// the arrow never overlaps a long label.
+	submenuWidth int
+
+	accelGap  int
+	minHeight int
+	sepHeight int
+
+	// themed records whether the measurements came from the visual style.
+	themed bool
 }
 
 // accelGapChars is the space between a label and its accelerator, in average
-// character widths of the menu font.
+// character widths of the menu font. The theme has no property for it.
 const accelGapChars = 4
 
 // menuFontForDpi returns the user's menu font for the given DPI.
@@ -110,64 +132,130 @@ func menuFontForDpi(dpi w32.UINT) w32.HFONT {
 // newMenuMetrics derives the layout for hwnd's current DPI.
 func newMenuMetrics(hwnd w32.HWND) *menuMetrics {
 	dpi := w32.GetDpiForWindow(hwnd)
+	m := &menuMetrics{dpi: dpi, font: menuFontForDpi(dpi)}
 
-	m := &menuMetrics{
-		dpi:         dpi,
-		font:        menuFontForDpi(dpi),
-		checkGutter: w32.SystemMetricForDpi(w32.SM_CXMENUCHECK, dpi),
-		minHeight:   w32.SystemMetricForDpi(w32.SM_CYMENUCHECK, dpi),
-	}
-
-	// The remaining values depend on the font, so they need a device context
-	// with that font selected.
 	hdc := w32.GetDC(hwnd)
 	if hdc != 0 {
-		var old w32.HGDIOBJ
+		var oldFont w32.HGDIOBJ
 		if m.font != 0 {
-			old = w32.SelectObject(hdc, w32.HGDIOBJ(m.font))
+			oldFont = w32.SelectObject(hdc, w32.HGDIOBJ(m.font))
 		}
 
-		var tm w32.TEXTMETRIC
-		if w32.GetTextMetrics(hdc, &tm) {
-			m.paddingX = int(tm.TmAveCharWidth)
-			m.accelGap = int(tm.TmAveCharWidth) * accelGapChars
+		m.applyThemeMetrics(hwnd, hdc)
+		m.applyFontMetrics(hdc)
 
-			lineHeight := int(tm.TmHeight + tm.TmExternalLeading)
-			// One edge above and below the text, matching the spacing Windows
-			// uses between a menu item's text and its bounds.
-			m.minHeight = max(m.minHeight, lineHeight+2*w32.SystemMetricForDpi(w32.SM_CYEDGE, dpi))
-			// A separator is a rule with space around it rather than a text
-			// row, so it takes half a line.
-			m.sepHeight = lineHeight / 2
-		}
-
-		if old != 0 {
-			w32.SelectObject(hdc, old)
+		if oldFont != 0 {
+			w32.SelectObject(hdc, oldFont)
 		}
 		w32.ReleaseDC(hwnd, hdc)
 	}
 
-	// Floors for the cases where the device context or text metrics were
-	// unavailable. Border width is itself a DPI-scaled system metric, so these
-	// still scale.
-	border := w32.SystemMetricForDpi(w32.SM_CYBORDER, dpi)
-	if m.paddingX <= 0 {
-		m.paddingX = w32.SystemMetricForDpi(w32.SM_CXEDGE, dpi)
-	}
-	if m.accelGap <= 0 {
-		m.accelGap = m.paddingX * accelGapChars
-	}
-	if m.minHeight <= 0 {
-		m.minHeight = w32.SystemMetricForDpi(w32.SM_CYMENU, dpi)
-	}
-	m.sepHeight = max(m.sepHeight, 2*border+1)
-
-	// The gutter has to hold the checkmark and still leave the label clear of
-	// it.
-	m.checkGutter += m.paddingX
-
+	m.applyFallbacks()
 	return m
 }
+
+// applyThemeMetrics fills in the geometry the visual style defines. It leaves
+// the fields at zero when the theme is unavailable, for applyFallbacks to cover.
+func (m *menuMetrics) applyThemeMetrics(hwnd w32.HWND, hdc w32.HDC) {
+	hTheme := w32.OpenThemeData(hwnd, "Menu")
+	if hTheme == 0 {
+		return
+	}
+	defer w32.CloseThemeData(hTheme)
+
+	m.themed = true
+
+	if sz, ok := w32.GetThemePartSize(hTheme, hdc, w32.MENU_POPUPCHECK, w32.MC_CHECKMARKNORMAL, w32.TS_TRUE); ok {
+		m.checkWidth, m.checkHeight = int(sz.CX), int(sz.CY)
+	}
+
+	// The gutter is the checkmark plus the background it sits in plus the
+	// divider column, which together are what separates a label from the left
+	// edge of the popup. This is the measurement SM_CXMENUCHECK is not.
+	gutter := m.checkWidth
+	if mg, ok := w32.GetThemeMargins(hTheme, hdc, w32.MENU_POPUPCHECKBACKGROUND, w32.MCB_NORMAL, w32.TMT_CONTENTMARGINS); ok {
+		gutter += int(mg.CxLeftWidth + mg.CxRightWidth)
+		m.minHeight = max(m.minHeight, m.checkHeight+int(mg.CyTopHeight+mg.CyBottomHeight))
+	}
+	if sz, ok := w32.GetThemePartSize(hTheme, hdc, w32.MENU_POPUPGUTTER, 0, w32.TS_TRUE); ok {
+		gutter += int(sz.CX)
+	}
+	m.gutterWidth = gutter
+
+	if mg, ok := w32.GetThemeMargins(hTheme, hdc, w32.MENU_POPUPITEM, w32.MPI_NORMAL, w32.TMT_CONTENTMARGINS); ok {
+		m.itemPadLeft, m.itemPadRight = int(mg.CxLeftWidth), int(mg.CxRightWidth)
+		m.minHeight = max(m.minHeight, int(mg.CyTopHeight+mg.CyBottomHeight))
+	}
+
+	// Windows reserves the submenu column on every item, not just the ones with
+	// a submenu, which is why a native popup is wider than its longest label.
+	if sz, ok := w32.GetThemePartSize(hTheme, hdc, w32.MENU_POPUPSUBMENU, w32.MSM_NORMAL, w32.TS_TRUE); ok {
+		m.submenuWidth = int(sz.CX)
+	}
+
+	if sz, ok := w32.GetThemePartSize(hTheme, hdc, w32.MENU_POPUPSEPARATOR, 0, w32.TS_TRUE); ok {
+		m.sepHeight = int(sz.CY)
+	}
+}
+
+// applyFontMetrics fills in the values that depend on the menu font rather than
+// on the theme. hdc must already have the menu font selected.
+func (m *menuMetrics) applyFontMetrics(hdc w32.HDC) {
+	var tm w32.TEXTMETRIC
+	if !w32.GetTextMetrics(hdc, &tm) {
+		return
+	}
+	m.accelGap = int(tm.TmAveCharWidth) * accelGapChars
+
+	// An item is at least tall enough for its text plus the item's vertical
+	// content margins, which applyThemeMetrics has already folded into
+	// minHeight.
+	m.minHeight = max(m.minHeight, int(tm.TmHeight+tm.TmExternalLeading)+m.verticalPadding())
+}
+
+// verticalPadding is the space above and below an item's text. The theme's item
+// margins cover it when themed; otherwise fall back to the classic edge metric.
+func (m *menuMetrics) verticalPadding() int {
+	if m.themed {
+		return 0
+	}
+	return 2 * w32.SystemMetricForDpi(w32.SM_CYEDGE, m.dpi)
+}
+
+// applyFallbacks covers the classic style, High Contrast, and the case where the
+// device context could not be obtained. Every fallback is a DPI-scaled system
+// metric rather than a fixed pixel count, so it still follows display scaling -
+// it is simply the classic geometry rather than the themed geometry.
+func (m *menuMetrics) applyFallbacks() {
+	if m.checkWidth <= 0 {
+		m.checkWidth = w32.SystemMetricForDpi(w32.SM_CXMENUCHECK, m.dpi)
+	}
+	if m.checkHeight <= 0 {
+		m.checkHeight = w32.SystemMetricForDpi(w32.SM_CYMENUCHECK, m.dpi)
+	}
+	if m.itemPadLeft <= 0 {
+		m.itemPadLeft = w32.SystemMetricForDpi(w32.SM_CXEDGE, m.dpi)
+	}
+	if m.itemPadRight <= 0 {
+		m.itemPadRight = m.itemPadLeft
+	}
+	if m.gutterWidth <= 0 {
+		m.gutterWidth = m.checkWidth + 2*m.itemPadLeft
+	}
+	if m.submenuWidth <= 0 {
+		m.submenuWidth = w32.SystemMetricForDpi(w32.SM_CXMENUSIZE, m.dpi)
+	}
+	if m.accelGap <= 0 {
+		m.accelGap = m.itemPadLeft * accelGapChars
+	}
+	if m.minHeight <= 0 {
+		m.minHeight = w32.SystemMetricForDpi(w32.SM_CYMENU, m.dpi)
+	}
+	m.sepHeight = max(m.sepHeight, 2*w32.SystemMetricForDpi(w32.SM_CYBORDER, m.dpi)+1)
+}
+
+// textLeft is where an item's label starts.
+func (m *menuMetrics) textLeft() int { return m.gutterWidth + m.itemPadLeft }
 
 func (m *menuMetrics) release() {
 	if m == nil {
@@ -261,6 +349,44 @@ func (w *windowsWebviewWindow) menuColours() menuColours {
 	return lightMenuColours
 }
 
+// drawCheck paints the checkmark and the background panel behind it, centred in
+// the gutter at the size the theme reports.
+//
+// Windows draws MENU_POPUPCHECK inside MENU_POPUPCHECKBACKGROUND, and the panel
+// is what makes a checked item read as checked at a glance. DrawThemeBackground
+// is not used for either: it would paint them in the system theme's colours,
+// which on a light system means a dark glyph on our dark background.
+func (m *menuMetrics) drawCheck(hdc w32.HDC, rect w32.RECT, colours menuColours, selected, disabled, radio bool) {
+	height := int(rect.Bottom - rect.Top)
+
+	panel := w32.RECT{
+		Left:   rect.Left + int32(m.itemPadLeft),
+		Right:  rect.Left + int32(m.itemPadLeft+m.checkWidth),
+		Top:    rect.Top + int32(max((height-m.checkHeight)/2, 0)),
+		Bottom: rect.Top + int32(max((height-m.checkHeight)/2, 0)+m.checkHeight),
+	}
+
+	if !selected {
+		panelBrush := w32.CreateSolidBrush(colours.checkBackground)
+		w32.FillRect(hdc, &panel, panelBrush)
+		w32.DeleteObject(w32.HGDIOBJ(panelBrush))
+	}
+
+	glyph := "✓"
+	if radio {
+		glyph = "●"
+	}
+
+	previous := w32.SetTextColor(hdc, w32.COLORREF(colours.text))
+	if disabled {
+		w32.SetTextColor(hdc, w32.COLORREF(colours.disabledText))
+	} else if selected {
+		w32.SetTextColor(hdc, w32.COLORREF(colours.selectedText))
+	}
+	drawMenuString(hdc, glyph, &panel, w32.DT_CENTER|w32.DT_SINGLELINE|w32.DT_VCENTER)
+	w32.SetTextColor(hdc, previous)
+}
+
 // handleMeasureMenuItem sizes an owner-drawn popup item. Without this, Windows
 // has no size for the item and renders it collapsed.
 func (w *windowsWebviewWindow) handleMeasureMenuItem(lparam uintptr) bool {
@@ -274,7 +400,7 @@ func (w *windowsWebviewWindow) handleMeasureMenuItem(lparam uintptr) bool {
 	item, ok := w.menuItemFor(mis.ItemID)
 	if !ok {
 		mis.ItemHeight = uint32(metrics.minHeight)
-		mis.ItemWidth = uint32(metrics.checkGutter)
+		mis.ItemWidth = uint32(metrics.textLeft())
 		return true
 	}
 	if item.IsSeparator() {
@@ -288,7 +414,7 @@ func (w *windowsWebviewWindow) handleMeasureMenuItem(lparam uintptr) bool {
 	hdc := w32.GetDC(w.hwnd)
 	if hdc == 0 {
 		mis.ItemHeight = uint32(metrics.minHeight)
-		mis.ItemWidth = uint32(metrics.checkGutter)
+		mis.ItemWidth = uint32(metrics.textLeft())
 		return true
 	}
 	var labelW, labelH, accelW int
@@ -298,11 +424,13 @@ func (w *windowsWebviewWindow) handleMeasureMenuItem(lparam uintptr) bool {
 	})
 	w32.ReleaseDC(w.hwnd, hdc)
 
-	width := metrics.checkGutter + labelW + metrics.paddingX
+	// The submenu column is reserved on every item, matching Windows, so an
+	// arrow can never be drawn over a label that was measured without it.
+	width := metrics.textLeft() + labelW + metrics.itemPadRight + metrics.submenuWidth
 	if accelW > 0 {
 		width += metrics.accelGap + accelW
 	}
-	height := max(labelH+2*w32.SystemMetricForDpi(w32.SM_CYEDGE, metrics.dpi), metrics.minHeight)
+	height := max(labelH+metrics.verticalPadding(), metrics.minHeight)
 
 	mis.ItemWidth = uint32(width)
 	mis.ItemHeight = uint32(height)
@@ -352,10 +480,13 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 	if isSeparator {
 		lineBrush := w32.CreateSolidBrush(colours.separator)
 		mid := rect.Top + (rect.Bottom-rect.Top)/2
+		// A separator spans the text column only, starting right of the gutter,
+		// the way MENU_POPUPSEPARATOR is drawn. Running it the full width of the
+		// popup is one of the things that reads as not-native.
 		line := w32.RECT{
-			Left:   rect.Left + int32(metrics.paddingX),
+			Left:   rect.Left + int32(metrics.gutterWidth),
 			Top:    mid,
-			Right:  rect.Right - int32(metrics.paddingX),
+			Right:  rect.Right - int32(metrics.itemPadRight),
 			Bottom: mid + int32(w32.SystemMetricForDpi(w32.SM_CYBORDER, metrics.dpi)),
 		}
 		w32.FillRect(dis.HDC, &line, lineBrush)
@@ -378,26 +509,25 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 	w32.SetTextColor(dis.HDC, w32.COLORREF(textColour))
 
 	if dis.ItemState&w32.ODS_CHECKED != 0 {
-		check := rect
-		check.Left += int32(w32.SystemMetricForDpi(w32.SM_CXEDGE, metrics.dpi))
-		check.Right = check.Left + int32(metrics.checkGutter)
-		drawMenuString(dis.HDC, "✓", &check, w32.DT_LEFT|w32.DT_SINGLELINE|w32.DT_VCENTER)
+		metrics.drawCheck(dis.HDC, rect, colours, selected, disabled, item.IsRadio())
 	}
 
+	// The label occupies the text column: right of the gutter, left of the
+	// reserved submenu column.
 	labelRect := rect
-	labelRect.Left += int32(metrics.checkGutter)
-	labelRect.Right -= int32(metrics.paddingX)
+	labelRect.Left += int32(metrics.textLeft())
+	labelRect.Right -= int32(metrics.itemPadRight + metrics.submenuWidth)
 	drawMenuString(dis.HDC, label, &labelRect, w32.DT_LEFT|w32.DT_SINGLELINE|w32.DT_VCENTER)
 
 	if hasSubmenu {
+		// Drawn inside the column reserved for it in handleMeasureMenuItem, so
+		// it cannot land on top of a long label.
 		arrow := rect
-		arrow.Left = labelRect.Left
-		arrow.Right -= int32(w32.SystemMetricForDpi(w32.SM_CXEDGE, metrics.dpi))
-		drawMenuString(dis.HDC, "▸", &arrow, w32.DT_RIGHT|w32.DT_SINGLELINE|w32.DT_VCENTER)
+		arrow.Left = rect.Right - int32(metrics.itemPadRight+metrics.submenuWidth)
+		arrow.Right = rect.Right - int32(metrics.itemPadRight)
+		drawMenuString(dis.HDC, "▸", &arrow, w32.DT_CENTER|w32.DT_SINGLELINE|w32.DT_VCENTER)
 	} else if accel != "" {
-		accelRect := rect
-		accelRect.Left = labelRect.Left
-		accelRect.Right -= int32(metrics.paddingX)
+		accelRect := labelRect
 		w32.SetTextColor(dis.HDC, w32.COLORREF(colours.disabledText))
 		drawMenuString(dis.HDC, accel, &accelRect, w32.DT_RIGHT|w32.DT_SINGLELINE|w32.DT_VCENTER)
 	}
