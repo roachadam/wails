@@ -33,10 +33,14 @@ type menuColours struct {
 	// MENU_POPUPCHECKBACKGROUND. Without it a checked item is much harder to
 	// pick out.
 	checkBackground uint32
-	disabledText    uint32
-	selectedBg      uint32
-	selectedText    uint32
-	separator       uint32
+	// checkFramed draws the check panel as an outline rather than a filled
+	// block. High Contrast schemes do it that way, and filling it with the
+	// highlight colour there is far too loud.
+	checkFramed  bool
+	disabledText uint32
+	selectedBg   uint32
+	selectedText uint32
+	separator    uint32
 }
 
 // rgb packs a colour to COLORREF byte order (0x00BBGGRR).
@@ -420,9 +424,12 @@ func drawMenuString(hdc w32.HDC, s string, rect *w32.RECT, flags uint32) {
 func systemMenuColours() menuColours {
 	sys := func(index int) uint32 { return uint32(w32.GetSysColor(index)) }
 	return menuColours{
-		background:      sys(w32.COLOR_MENU),
-		text:            sys(w32.COLOR_MENUTEXT),
-		checkBackground: sys(w32.COLOR_HIGHLIGHT),
+		background: sys(w32.COLOR_MENU),
+		text:       sys(w32.COLOR_MENUTEXT),
+		// Outlined in the text colour, the way these schemes draw it. Filling
+		// it with COLOR_HIGHLIGHT produced a solid block that read as selected.
+		checkBackground: sys(w32.COLOR_MENUTEXT),
+		checkFramed:     true,
 		disabledText:    sys(w32.COLOR_GRAYTEXT),
 		selectedBg:      sys(w32.COLOR_HIGHLIGHT),
 		selectedText:    sys(w32.COLOR_HIGHLIGHTTEXT),
@@ -466,7 +473,11 @@ func (m *menuMetrics) drawCheck(hdc w32.HDC, rect w32.RECT, colours menuColours,
 
 	if !selected {
 		panelBrush := w32.CreateSolidBrush(colours.checkBackground)
-		w32.FillRect(hdc, &panel, panelBrush)
+		if colours.checkFramed {
+			w32.FrameRect(hdc, &panel, panelBrush)
+		} else {
+			w32.FillRect(hdc, &panel, panelBrush)
+		}
 		w32.DeleteObject(w32.HGDIOBJ(panelBrush))
 	}
 
@@ -627,8 +638,11 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 		arrow.Right = rect.Right - int32(metrics.itemPadRight)
 		drawMenuString(dis.HDC, "▸", &arrow, w32.DT_CENTER|w32.DT_SINGLELINE|w32.DT_VCENTER)
 	} else if accel != "" {
+		// Drawn in the item's own text colour. Windows does not dim
+		// accelerators - using the disabled colour made them look disabled,
+		// which is obvious under a High Contrast scheme where that colour is
+		// green rather than a slightly lighter grey.
 		accelRect := labelRect
-		w32.SetTextColor(dis.HDC, w32.COLORREF(colours.disabledText))
 		drawMenuString(dis.HDC, accel, &accelRect, w32.DT_RIGHT|w32.DT_SINGLELINE|w32.DT_VCENTER)
 	}
 
