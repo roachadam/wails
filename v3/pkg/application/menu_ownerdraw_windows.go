@@ -194,19 +194,23 @@ func (w *windowsWebviewWindow) currentMenuMetrics() *menuMetrics {
 	return w.menuMetrics
 }
 
-// menuItemFor resolves an owner-drawn item from the menu's own mapping, keyed by
-// the Win32 item id.
+// menuItemFor resolves an owner-drawn item from the menu's draw mapping, keyed
+// by the identifier Windows reports in WM_DRAWITEM and WM_MEASUREITEM.
 //
-// The global menuItemMap is not usable here: Menu.AddSeparator never registers
-// its item, so getMenuItemByID returns nil for every separator. Win32Menu's
-// menuMapping is populated for all items during buildMenu, separators included,
-// which lets separators be identified explicitly rather than inferred from a
-// failed lookup.
+// Two mappings that look interchangeable are not. menuMapping is keyed by
+// command id for WM_COMMAND dispatch; drawMapping is keyed by whatever was
+// handed to AppendMenu, which for an MF_POPUP item is the submenu's HMENU
+// instead. Using menuMapping here silently fails to resolve every submenu item.
+//
+// The global menuItemMap is not usable either: Menu.AddSeparator never registers
+// its item, so getMenuItemByID returns nil for every separator. drawMapping is
+// populated for all items, separators included, which lets separators be
+// identified explicitly rather than inferred from a failed lookup.
 func (w *windowsWebviewWindow) menuItemFor(itemID uint32) (*MenuItem, bool) {
-	if w.menu == nil || w.menu.menuMapping == nil {
+	if w.menu == nil || w.menu.drawMapping == nil {
 		return nil, false
 	}
-	item, ok := w.menu.menuMapping[int(itemID)]
+	item, ok := w.menu.drawMapping[int(itemID)]
 	return item, ok && item != nil
 }
 
@@ -337,7 +341,15 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 	w32.FillRect(dis.HDC, &rect, bgBrush)
 	w32.DeleteObject(w32.HGDIOBJ(bgBrush))
 
-	if !ok || isSeparator {
+	// Only a genuine separator draws a rule. An item that failed to resolve gets
+	// the background and nothing else - drawing a rule there would disguise a
+	// lookup failure as a deliberate separator, which is how the submenu items
+	// silently rendered as blank rules.
+	if !ok {
+		return true
+	}
+
+	if isSeparator {
 		lineBrush := w32.CreateSolidBrush(colours.separator)
 		mid := rect.Top + (rect.Bottom-rect.Top)/2
 		line := w32.RECT{

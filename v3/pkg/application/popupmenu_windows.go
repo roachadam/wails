@@ -44,11 +44,17 @@ func (r *RadioGroup) MenuID(item *MenuItem) int {
 }
 
 type Win32Menu struct {
-	isPopup       bool
-	menu          w32.HMENU
-	parentWindow  *windowsWebviewWindow
-	parent        w32.HWND
-	menuMapping   map[int]*MenuItem
+	isPopup      bool
+	menu         w32.HMENU
+	parentWindow *windowsWebviewWindow
+	parent       w32.HWND
+	menuMapping  map[int]*MenuItem
+	// drawMapping resolves items for owner-draw, keyed by the identifier
+	// AppendMenu was actually given. That is the sequential command id for a
+	// normal item, but the submenu's HMENU for an MF_POPUP item, and WM_DRAWITEM
+	// reports whichever was used. menuMapping cannot serve both because it is
+	// keyed by command id for dispatch.
+	drawMapping   map[int]*MenuItem
 	checkboxItems map[*MenuItem][]int
 	radioGroups   map[*MenuItem][]*RadioGroup
 	menuData      *Menu
@@ -212,6 +218,12 @@ func (p *Win32Menu) buildMenuLevel(parentMenu w32.HMENU, inputMenu *Menu, ownerD
 			continue
 		}
 
+		// Record the item under the identifier AppendMenu is about to be given.
+		// For an MF_POPUP item that is the submenu's HMENU rather than the
+		// command id, and WM_DRAWITEM/WM_MEASUREITEM report the same value, so
+		// this is the only key an owner-draw lookup can use.
+		p.drawMapping[itemID] = item
+
 		ok := w32.AppendMenu(parentMenu, flags, uintptr(itemID), w32.MustStringToUTF16Ptr(menuText))
 		if !ok {
 			return fmt.Errorf("AppendMenu failed for %q: %v", menuText, syscall.GetLastError())
@@ -246,6 +258,7 @@ func (p *Win32Menu) Update() {
 	newHMENU := p.newMenu()
 	oldHMENU := p.menu
 	oldMapping := p.menuMapping
+	oldDrawMapping := p.drawMapping
 	oldCheckboxes := p.checkboxItems
 	oldRadios := p.radioGroups
 	oldBitmaps := p.bitmaps
@@ -262,6 +275,7 @@ func (p *Win32Menu) Update() {
 
 	p.menu = newHMENU
 	p.menuMapping = make(map[int]*MenuItem)
+	p.drawMapping = make(map[int]*MenuItem)
 	p.checkboxItems = make(map[*MenuItem][]int)
 	p.radioGroups = make(map[*MenuItem][]*RadioGroup)
 	p.currentMenuID = MenuItemMsgID
@@ -282,6 +296,7 @@ func (p *Win32Menu) Update() {
 		w32.DestroyMenu(newHMENU)
 		p.menu = oldHMENU
 		p.menuMapping = oldMapping
+		p.drawMapping = oldDrawMapping
 		p.checkboxItems = oldCheckboxes
 		p.radioGroups = oldRadios
 		p.bitmaps = oldBitmaps
