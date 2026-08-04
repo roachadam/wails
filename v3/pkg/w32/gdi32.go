@@ -20,6 +20,8 @@ var (
 	procGetTextFace               = modgdi32.NewProc("GetTextFaceW")
 	procGetGlyphIndices           = modgdi32.NewProc("GetGlyphIndicesW")
 	procGetGlyphOutline           = modgdi32.NewProc("GetGlyphOutlineW")
+	procCreateRoundRectRgn        = modgdi32.NewProc("CreateRoundRectRgn")
+	procFillRgn                   = modgdi32.NewProc("FillRgn")
 	procAbortDoc                  = modgdi32.NewProc("AbortDoc")
 	procBitBlt                    = modgdi32.NewProc("BitBlt")
 	procPatBlt                    = modgdi32.NewProc("PatBlt")
@@ -692,4 +694,28 @@ func GlyphInkHeight(hdc HDC, r rune) int {
 		return 0
 	}
 	return int(gm.GmBlackBoxY)
+}
+
+// CreateRoundRectRgn makes a rectangular region with rounded corners.
+//
+// The ellipse arguments are the full width and height of the corner ellipse, so
+// a corner radius of r is passed as 2*r.
+//
+// Returns 0 on failure; callers must DeleteObject the result.
+func CreateRoundRectRgn(left, top, right, bottom, ellipseWidth, ellipseHeight int) HRGN {
+	ret, _, _ := procCreateRoundRectRgn.Call(
+		uintptr(left),
+		uintptr(top),
+		uintptr(right),
+		uintptr(bottom),
+		uintptr(ellipseWidth),
+		uintptr(ellipseHeight),
+	)
+	return HRGN(ret)
+}
+
+// FillRgn fills a region with a brush.
+func FillRgn(hdc HDC, hrgn HRGN, brush HBRUSH) bool {
+	ret, _, _ := procFillRgn.Call(uintptr(hdc), uintptr(hrgn), uintptr(brush))
+	return ret != 0
 }

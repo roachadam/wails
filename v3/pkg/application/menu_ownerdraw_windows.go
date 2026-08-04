@@ -222,9 +222,10 @@ func iconFontForInk(hwnd w32.HWND, glyph string, target int) w32.HFONT {
 	em := target
 	if probe := newIconFont(probeEm); probe != 0 {
 		if ink := glyphInk(hwnd, probe, glyph); ink > 0 {
-			// Round to nearest rather than truncating: at these sizes one pixel
-			// is a visible fraction of the glyph.
-			em = (probeEm*target*2/ink + 1) / 2
+			// Truncate rather than round to nearest. Rounding up put the ink a
+			// pixel over the artwork's, which reads as a heavier tick and a
+			// noticeably larger radio dot beside a native menu.
+			em = probeEm * target / ink
 		}
 		w32.DeleteObject(w32.HGDIOBJ(probe))
 	}
@@ -244,6 +245,22 @@ func glyphInk(hwnd w32.HWND, font w32.HFONT, glyph string) int {
 		w32.SelectObject(hdc, old)
 	}
 	return ink
+}
+
+// newInkGlyph builds the icon font sized so glyph's ink is about target tall,
+// falling back to Marlett at that size when the icon font cannot draw it.
+//
+// The font iconFontForInk returns is used directly. An earlier version measured
+// its em and rebuilt from that, which lost a pixel or two to rounding and left
+// the checkmark visibly smaller than the one Windows draws.
+func newInkGlyph(hwnd w32.HWND, target int, icon, marlett string) (w32.HFONT, string) {
+	if font := iconFontForInk(hwnd, icon, target); font != 0 {
+		if fontCanDraw(hwnd, font, icon) {
+			return font, icon
+		}
+		w32.DeleteObject(w32.HGDIOBJ(font))
+	}
+	return newMarlettFont(target), marlett
 }
 
 // contentBox is a themed part less its own margins, floored so a part that
@@ -374,8 +391,25 @@ func newMenuMetrics(hwnd w32.HWND) *menuMetrics {
 	// checkmark part is nearer 10px, and an icon glyph drawn at the full 16
 	// comes out visibly larger than the one Windows draws. The submenu part is
 	// barely padded, so its arrow gets close to the full size instead.
-	m.checkFont, m.checkChar = newGlyphFont(hwnd, contentBox(m.checkHeight, m.checkMarginY), iconCheck, marlettCheck)
-	m.bulletFont, m.bulletChar = newGlyphFont(hwnd, contentBox(m.checkHeight, m.checkMarginY), iconBullet, marlettBullet)
+	// Sized by the ink of the artwork Windows draws, the same as the arrow
+	// below. The em box undershoots because an icon font pads its glyphs inside
+	// the em, so a tick sized to the part's content box comes out noticeably
+	// smaller than the one a native menu draws. Falls back to the content box
+	// when the part cannot be measured.
+	checkInk := themedInkHeight(hwnd, w32.MENU_POPUPCHECK, w32.MC_CHECKMARKNORMAL, m.checkWidth, m.checkHeight)
+	if checkInk <= 0 {
+		checkInk = contentBox(m.checkHeight, m.checkMarginY)
+	}
+	m.checkFont, m.checkChar = newInkGlyph(hwnd, checkInk, iconCheck, marlettCheck)
+
+	// The bullet is measured separately. Its artwork is a small dot where the
+	// checkmark's is a tick that fills most of the part, so sizing it to the
+	// checkmark's ink drew a dot half again too big.
+	bulletInk := themedInkHeight(hwnd, w32.MENU_POPUPCHECK, w32.MC_BULLETNORMAL, m.checkWidth, m.checkHeight)
+	if bulletInk <= 0 {
+		bulletInk = checkInk
+	}
+	m.bulletFont, m.bulletChar = newInkGlyph(hwnd, bulletInk, iconBullet, marlettBullet)
 	// The arrow is sized by its ink rather than by the em box. Its part carries
 	// almost no margin, so the target is the part itself, and at nine pixels the
 	// shortfall from em-box sizing is most of the glyph. The check and the
@@ -389,14 +423,7 @@ func newMenuMetrics(hwnd w32.HWND) *menuMetrics {
 	if arrowInk <= 0 {
 		arrowInk = contentBox(m.submenuGlyph, m.submenuMarginY)
 	}
-	if font := iconFontForInk(hwnd, iconChevronRight, arrowInk); font != 0 && fontCanDraw(hwnd, font, iconChevronRight) {
-		m.submenuFont, m.submenuChar = font, iconChevronRight
-	} else {
-		if font != 0 {
-			w32.DeleteObject(w32.HGDIOBJ(font))
-		}
-		m.submenuFont, m.submenuChar = newMarlettFont(m.submenuGlyph), marlettSubmenu
-	}
+	m.submenuFont, m.submenuChar = newInkGlyph(hwnd, arrowInk, iconChevronRight, marlettSubmenu)
 
 	return m
 }
@@ -766,20 +793,18 @@ func (w *windowsWebviewWindow) menuColours() menuColours {
 // is not used for either: it would paint them in the system theme's colours,
 // which on a light system means a dark glyph on our dark background.
 func (m *menuMetrics) drawCheck(hdc w32.HDC, rect w32.RECT, colours menuColours, selected, disabled, radio bool) {
-	height := int(rect.Bottom - rect.Top)
-
-	// Centre the glyph in the check column rather than pinning it to the left
-	// edge. checkMarginX is the padding either side of it, and the item's own
-	// left padding is 0 under the visual style, so without this the tick sits
-	// against the popup border.
-	left := m.itemPadLeft + m.checkMarginX/2
-	top := max((height-m.checkHeight)/2, 0)
-
+	// The panel is the background of the check column, not a box around the
+	// glyph: it spans the item's full height, so two checked rows next to each
+	// other form one continuous strip the way a native menu does. Drawing it at
+	// the checkmark's own height instead leaves a gap between them.
+	//
+	// Its width is the check plus the margins either side, which is the gutter
+	// less the gap that separates the column from the label.
 	panel := w32.RECT{
-		Left:   rect.Left + int32(left),
-		Right:  rect.Left + int32(left+m.checkWidth),
-		Top:    rect.Top + int32(top),
-		Bottom: rect.Top + int32(top+m.checkHeight),
+		Left:   rect.Left + int32(m.itemPadLeft),
+		Right:  rect.Left + int32(m.itemPadLeft+m.checkWidth+m.checkMarginX),
+		Top:    rect.Top,
+		Bottom: rect.Bottom,
 	}
 
 	if !selected {
@@ -892,13 +917,40 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 	selected := dis.ItemState&w32.ODS_SELECTED != 0
 	disabled := dis.ItemState&(w32.ODS_GRAYED|w32.ODS_DISABLED) != 0
 
-	bg := colours.background
+	surface := w32.CreateSolidBrush(colours.background)
+	w32.FillRect(dis.HDC, &rect, surface)
+	w32.DeleteObject(w32.HGDIOBJ(surface))
+
+	// The highlight is inset by the item's own horizontal padding rather than
+	// filling the row edge to edge. That padding is 0 on Windows 10, where a
+	// native band does span the popup, and 3 on Windows 11, where it does not -
+	// so the theme already describes the difference and no version check is
+	// needed.
 	if selected && !disabled && !isSeparator {
-		bg = colours.selectedBg
+		band := rect
+		band.Left += int32(metrics.itemPadLeft)
+		band.Right -= int32(metrics.itemPadRight)
+		hot := w32.CreateSolidBrush(colours.selectedBg)
+
+		// Rounded to the same padding that insets it, which is 0 on Windows 10 -
+		// square band, spanning the row - and non-zero on Windows 11, where the
+		// band is both inset and rounded. One number describes both differences,
+		// so neither needs a version check.
+		radius := metrics.itemPadLeft
+		if radius > 0 {
+			rgn := w32.CreateRoundRectRgn(int(band.Left), int(band.Top),
+				int(band.Right), int(band.Bottom), radius*2, radius*2)
+			if rgn != 0 {
+				w32.FillRgn(dis.HDC, rgn, hot)
+				w32.DeleteObject(w32.HGDIOBJ(rgn))
+			} else {
+				w32.FillRect(dis.HDC, &band, hot)
+			}
+		} else {
+			w32.FillRect(dis.HDC, &band, hot)
+		}
+		w32.DeleteObject(w32.HGDIOBJ(hot))
 	}
-	bgBrush := w32.CreateSolidBrush(bg)
-	w32.FillRect(dis.HDC, &rect, bgBrush)
-	w32.DeleteObject(w32.HGDIOBJ(bgBrush))
 
 	if isSeparator {
 		lineBrush := w32.CreateSolidBrush(colours.separator)

@@ -171,7 +171,6 @@ func OpenThemeDataForDpi(hwnd HWND, classList string, dpi UINT) HTHEME {
 	return HTHEME(ret)
 }
 
-
 var procGetThemeColor = uxtheme.NewProc("GetThemeColor")
 
 // GetThemeColor returns a colour property of a themed part.
