@@ -3,28 +3,105 @@
 package application
 
 import (
+	"fmt"
+	"unicode"
 	"unsafe"
 
 	"github.com/wailsapp/wails/v3/pkg/w32"
 )
 
-// Owner-drawn popup menu items.
-//
-// Windows draws popup menu item text from the uxtheme theme, which follows the
-// system light/dark setting. There is no API to force dark menu text while the
-// OS is in light mode: on 1809 the app-level opt-in is AllowDarkModeForApp,
-// which only means "follow the system", and SetPreferredAppMode's ForceDark does
-// not exist before build 18334. So a window asking for Windows.Theme == Dark on
-// a light-mode OS got a dark menu background painted by updateTheme with dark
-// system text on top of it - unreadable.
-//
-// Owner-drawing the items bypasses uxtheme: wails supplies both the background
-// and the text colour, so an explicit theme renders correctly on any build and
-// any system setting.
-//
-// Everything about the layout is derived from the system rather than hardcoded,
-// so items scale with the user's menu font and the window's DPI. See
-// menuMetrics.
+// Popup items are owner-drawn so their text follows the window theme rather
+// than the process-wide system theme. Layout still comes from Windows metrics.
+
+// ownerDrawMenuData is native memory referenced by MENUITEMINFO.DwItemData.
+// Windows retains this pointer, so neither the structure nor its text may live
+// on the Go heap. MSAAMENUINFO also exposes the label to accessibility tools.
+type ownerDrawMenuData struct {
+	infoMemory w32.HGLOBAL
+	textMemory w32.HGLOBAL
+	text       string
+}
+
+type ownerDrawMenuEntry struct {
+	item *MenuItem
+	data *ownerDrawMenuData
+}
+
+func newOwnerDrawMenuData(text string) (*ownerDrawMenuData, error) {
+	d := &ownerDrawMenuData{}
+	infoSize := unsafe.Sizeof(w32.MSAAMENUINFO{})
+	if infoSize > uintptr(^uint32(0)) {
+		return nil, fmt.Errorf("MSAAMENUINFO is too large")
+	}
+	d.infoMemory = w32.TryGlobalAlloc(0, uint32(infoSize))
+	if d.infoMemory == 0 {
+		return nil, fmt.Errorf("GlobalAlloc failed for MSAAMENUINFO")
+	}
+	if err := d.setText(text); err != nil {
+		d.release()
+		return nil, err
+	}
+	return d, nil
+}
+
+func allocNativeMenuText(text string) (w32.HGLOBAL, *uint16, uint32, error) {
+	chars := w32.MustStringToUTF16(text)
+	byteCount := uint64(len(chars)) * uint64(unsafe.Sizeof(uint16(0)))
+	if byteCount > uint64(^uint32(0)) {
+		return 0, nil, 0, fmt.Errorf("menu label is too large")
+	}
+	memory := w32.TryGlobalAlloc(0, uint32(byteCount))
+	if memory == 0 {
+		return 0, nil, 0, fmt.Errorf("GlobalAlloc failed for menu label")
+	}
+	destination := unsafe.Slice((*uint16)(unsafe.Pointer(memory)), len(chars))
+	copy(destination, chars)
+	return memory, &destination[0], uint32(len(chars) - 1), nil
+}
+
+func (d *ownerDrawMenuData) setText(text string) error {
+	if d == nil || d.infoMemory == 0 {
+		return fmt.Errorf("owner-draw menu data is not allocated")
+	}
+	if d.textMemory != 0 && d.text == text {
+		return nil
+	}
+	memory, pointer, length, err := allocNativeMenuText(text)
+	if err != nil {
+		return err
+	}
+	info := (*w32.MSAAMENUINFO)(unsafe.Pointer(d.infoMemory))
+	oldText := d.textMemory
+	info.DwMSAASignature = w32.MSAA_MENU_SIG
+	info.CchWText = length
+	info.PszWText = pointer
+	d.textMemory = memory
+	d.text = text
+	if oldText != 0 {
+		w32.GlobalFree(oldText)
+	}
+	return nil
+}
+
+func (d *ownerDrawMenuData) itemData() uintptr {
+	if d == nil {
+		return 0
+	}
+	return uintptr(d.infoMemory)
+}
+
+func (d *ownerDrawMenuData) release() {
+	if d == nil {
+		return
+	}
+	if d.infoMemory != 0 {
+		w32.GlobalFree(d.infoMemory)
+	}
+	if d.textMemory != 0 {
+		w32.GlobalFree(d.textMemory)
+	}
+	*d = ownerDrawMenuData{}
+}
 
 type menuColours struct {
 	background uint32
@@ -68,32 +145,13 @@ var lightMenuColours = menuColours{
 	separator:       rgb(215, 215, 215),
 }
 
-// menuMetrics holds the layout for one DPI.
-//
-// Geometry comes from the Menu visual style, not from GetSystemMetrics.
-// GetSystemMetrics returns the classic pre-theme values - SM_CXMENUCHECK, for
-// instance, is the size of the old checkmark bitmap, not the width of the gutter
-// a themed menu reserves - and using them produces a menu that is uniformly
-// tighter and narrower than the real thing. GetThemePartSize and
-// GetThemeMargins on the "Menu" class return what Windows actually draws with.
-//
-// The theme supplies the measurements only. The pixels are still ours, because
-// the entire purpose of owner-drawing here is to override the colours: calling
-// DrawThemeBackground for the checkmark or the submenu arrow would paint them in
-// the system theme's colours, which on a light system means a dark glyph on our
-// dark background - the very bug being fixed.
-//
-// Every value falls back to a DPI-scaled system metric when the theme is
-// unavailable, which is the case under the classic style and in High Contrast.
+// menuMetrics holds visual-style geometry for one DPI. System metrics are used
+// only when themes are unavailable because their classic menu sizes are smaller.
 type menuMetrics struct {
 	dpi w32.UINT
 
 	font w32.HFONT
-	// checkFont and submenuFont are Marlett at the sizes the theme reports for
-	// the checkmark and the submenu arrow. Two fonts because those parts are
-	// different sizes - 16px and 9px on the stock style.
-	// Each glyph carries its own font and character, because the icon font and
-	// the Marlett fallback use different codepoints and either may be in use.
+	// Glyph fonts may be Segoe MDL2 Assets or the Marlett fallback.
 	checkFont   w32.HFONT
 	checkChar   string
 	bulletFont  w32.HFONT
@@ -115,9 +173,7 @@ type menuMetrics struct {
 
 	// Derived layout.
 	gutterWidth int
-	// submenuWidth is reserved on the right of every item, as Windows does, so
-	// the arrow never overlaps a long label. submenuGlyph is the arrow itself,
-	// without the margins that make up the rest of that column.
+	// submenuWidth is reserved on every row; submenuGlyph is the arrow itself.
 	submenuWidth   int
 	submenuGlyph   int
 	submenuGlyphW  int
@@ -137,31 +193,11 @@ type menuMetrics struct {
 	themed bool
 }
 
-// labelReserve is the space Windows keeps to the right of every popup label,
-// before the submenu column.
-//
-// Windows adds no gap of its own between a label and its accelerator: a native
-// item with an accelerator is exactly as wide as the same item without one plus
-// the accelerator's text. The separation comes from this reserve, which is
-// present on every item whether or not it has an accelerator, and on submenu
-// items too.
-//
-// It is a constant. Measured against native popups on build 19045 it stayed at
-// 27 across DPI 96 and 120 and menu fonts of -12, -15 and -18, so it follows
-// neither the display scaling nor the font, and no theme part or system metric
-// available here evaluates to it at both DPIs - gutterWidth+SM_CXEDGE and
-// submenuWidth+submenuGlyph both give 27 at 96 DPI and neither does at 120.
-// Deriving it would mean inventing a formula that happens to fit, so it is
-// recorded as what it is.
+// labelReserve is the native gap between a label/accelerator and the submenu
+// column. No theme property exposes it; native measurements keep it at 27px.
 const labelReserve = 27
 
-// Marlett is the symbol font Windows draws menu glyphs from. Being a font it
-// renders in whatever text colour is set, which is why it can supply Windows'
-// own shapes without the colour problem that rules out DrawThemeBackground.
-//
-// The codes were read off a rendering of the whole font rather than recalled:
-// 4 is the larger triangle used for scrollbars, 8 the smaller one menus use,
-// and b and i are heavier variants of the check and the dot.
+// Marlett provides recolourable fallbacks for the menu glyphs.
 const (
 	marlettFace    = "Marlett"
 	marlettCheck   = "a" // 0x61, checkmark
@@ -169,13 +205,7 @@ const (
 	marlettSubmenu = "8" // 0x38, small right-pointing triangle
 )
 
-// Segoe MDL2 Assets is the icon font Windows 10 draws its own menu glyphs from.
-// They are different shapes from Marlett's, not the same shapes at another
-// size: a two-stroke chevron rather than a solid triangle, and a lighter check.
-// Resizing Marlett was never going to match them.
-//
-// The codes were picked off a rendering of the font's E7xx block rather than
-// recalled.
+// Segoe MDL2 Assets supplies the modern check, bullet, and chevron shapes.
 const (
 	iconFace         = "Segoe MDL2 Assets"
 	iconCheck        = "\ue73e" // CheckMark
@@ -367,43 +397,19 @@ func newMenuMetrics(hwnd w32.HWND) *menuMetrics {
 	// drawn item - a popup raises WM_DRAWITEM for every item on every repaint.
 	m.lightPalette, m.havePalette = themedLightColours(hwnd)
 
-	// All three glyphs are sized to the ink of the artwork Windows draws, not to
-	// the part that artwork sits in and not to the em box of the font drawing
-	// it. Both of those were tried:
-	//
-	//   - The part overshoots. The theme pads its artwork, so the ink inside a
-	//     16px checkmark part is nearer 10px.
-	//   - The part's content box - the part less its own margins - is closer but
-	//     still wrong in both directions. It leaves the tick noticeably smaller
-	//     than a native one, because the em box an icon font is asked for is
-	//     itself larger than the glyph inside it, and it overshoots for the
-	//     submenu arrow, whose part reports no margins at all.
-	//
-	// Measuring the ink sidesteps the question: themedInkHeight renders the part
-	// and reports how tall the result actually is, so the target is what a
-	// native menu puts on screen. The content box remains the fallback for when
-	// there is no visual style to render.
-	//
-	// The measurement scales with the DPI and the style, so the glyphs follow
-	// the menu rather than the label font.
+	// Theme part boxes include padding, so size glyph fonts from rendered ink.
 	checkInk := themedInkHeight(hwnd, w32.MENU_POPUPCHECK, w32.MC_CHECKMARKNORMAL, m.checkWidth, m.checkHeight)
 	if checkInk <= 0 {
 		checkInk = contentBox(m.checkHeight, m.checkMarginY)
 	}
 	m.checkFont, m.checkChar = newInkGlyph(hwnd, checkInk, iconCheck, marlettCheck)
 
-	// The bullet is measured separately. Its artwork is a small dot where the
-	// checkmark's is a tick that fills most of the part, so sizing it to the
-	// checkmark's ink drew a dot half again too big.
+	// The bullet occupies less of the check part and needs its own measurement.
 	bulletInk := themedInkHeight(hwnd, w32.MENU_POPUPCHECK, w32.MC_BULLETNORMAL, m.checkWidth, m.checkHeight)
 	if bulletInk <= 0 {
 		bulletInk = checkInk
 	}
 	m.bulletFont, m.bulletChar = newInkGlyph(hwnd, bulletInk, iconBullet, marlettBullet)
-	// The arrow is where measuring the ink matters most. Its part reports no
-	// margins, so the content box is the whole part, and the part's box is
-	// visibly taller than the chevron inside it - at nine pixels on the stock
-	// style the difference is most of the glyph.
 	arrowInk := themedInkHeight(hwnd, w32.MENU_POPUPSUBMENU, w32.MSM_NORMAL, m.submenuGlyphW, m.submenuGlyph)
 	if arrowInk <= 0 {
 		arrowInk = contentBox(m.submenuGlyph, m.submenuMarginY)
@@ -413,13 +419,7 @@ func newMenuMetrics(hwnd w32.HWND) *menuMetrics {
 	return m
 }
 
-// applyThemeMetrics reads the raw geometry the visual style defines. The values
-// are combined in finalise, because the item height depends on the text height
-// too and that is not known until the font has been measured.
-//
-// Every formula below was checked against a native popup on build 17763, read
-// back with GetMenuItemRect rather than estimated: item height 22, separator 7,
-// with a 15px menu font.
+// applyThemeMetrics reads raw geometry; finalise combines it with font metrics.
 func (m *menuMetrics) applyThemeMetrics(hwnd w32.HWND, hdc w32.HDC) {
 	hTheme := w32.OpenThemeData(hwnd, "Menu")
 	if hTheme == 0 {
@@ -432,10 +432,7 @@ func (m *menuMetrics) applyThemeMetrics(hwnd w32.HWND, hdc w32.HDC) {
 	if sz, ok := w32.GetThemePartSize(hTheme, hdc, w32.MENU_POPUPCHECK, w32.MC_CHECKMARKNORMAL, w32.TS_TRUE); ok {
 		m.checkWidth, m.checkHeight = int(sz.CX), int(sz.CY)
 	}
-	// The checkmark's own margins are the padding around the glyph - (3,3,3,3)
-	// on the stock style. MENU_POPUPCHECKBACKGROUND's margins are not: they are
-	// (0,6,0,0), so reading the vertical padding from there yields zero and the
-	// rows come out too short.
+	// The check part, not its background, owns the glyph padding.
 	if mg, ok := w32.GetThemeMargins(hTheme, hdc, w32.MENU_POPUPCHECK, w32.MC_CHECKMARKNORMAL, w32.TMT_CONTENTMARGINS); ok {
 		m.checkMarginX = int(mg.CxLeftWidth + mg.CxRightWidth)
 		m.checkMarginY = int(mg.CyTopHeight + mg.CyBottomHeight)
@@ -450,9 +447,7 @@ func (m *menuMetrics) applyThemeMetrics(hwnd w32.HWND, hdc w32.HDC) {
 		m.itemPadY = int(mg.CyTopHeight + mg.CyBottomHeight)
 	}
 
-	// Windows reserves the submenu column on every item, not just the ones with
-	// a submenu, which is why a native popup is wider than its longest label.
-	// The arrow's margins are part of that column.
+	// Windows reserves the submenu column on every item.
 	if sz, ok := w32.GetThemePartSize(hTheme, hdc, w32.MENU_POPUPSUBMENU, w32.MSM_NORMAL, w32.TS_TRUE); ok {
 		m.submenuWidth = int(sz.CX)
 		m.submenuGlyphW = int(sz.CX)
@@ -467,39 +462,18 @@ func (m *menuMetrics) applyThemeMetrics(hwnd w32.HWND, hdc w32.HDC) {
 		m.sepRule = int(sz.CY)
 	}
 
-	// Everything the theme expresses in its own units has to be scaled to the
-	// artwork it is actually drawing with. GetThemePartSize follows the display
-	// scaling; GetThemeMargins does not - it answers in the units of the 96 DPI
-	// artwork whatever DPI is asked for, including through OpenThemeDataForDpi.
-	// Laying a menu out from both leaves every item several pixels too tight at
-	// 150% and 200%.
-	//
-	// The factor is how much the artwork grew, not dpi/96, and those differ. At
-	// 125% on Windows 10 the check part goes 16 to 18 and its margins genuinely
-	// stay at 6; at 150% on Windows 11 it goes 16 to 25 and they become 10; at
-	// 200% it goes 16 to 32 and they become 12. All measured against native
-	// popups.
-	// Only the vertical margins and the reserve. Scaling the horizontal ones
-	// too made every popup wider than native by exactly their contribution -
-	// 12px at 200%, being checkMarginX 6 to 12 and the item padding 3 to 6 on
-	// each side. Windows evidently applies the artwork scale down the item and
-	// not across it. Measured on Windows 11 at 150% and 200%.
+	// Theme margins remain in 96-DPI artwork units. Native menus scale their
+	// vertical contribution and label reserve, but not horizontal padding.
 	scale := themeScale(hwnd, hdc, m.checkHeight)
 	m.checkMarginY = scale.apply(m.checkMarginY)
 	m.itemPadY = scale.apply(m.itemPadY)
 	m.labelReserveScaled = scale.apply(labelReserve)
 }
 
-// themeRatio is the factor between the artwork the theme draws with and the
-// artwork its margins are expressed in. Kept as a fraction rather than a float
-// so the arithmetic is exact and truncates the way the measurements did.
+// themeRatio scales 96-DPI theme margins using exact integer arithmetic.
 type themeRatio struct{ have, base int }
 
-// apply leaves v alone unless both halves of the ratio are known. A zero
-// numerator is as much a failed measurement as a zero denominator: the part
-// whose size it comes from may be missing from an incomplete style, and
-// scaling every margin to nothing collapses the menu rather than falling back
-// to it.
+// apply leaves v unchanged when the theme measurement is unavailable.
 func (r themeRatio) apply(v int) int {
 	if r.base <= 0 || r.have <= 0 {
 		return v
@@ -507,13 +481,7 @@ func (r themeRatio) apply(v int) int {
 	return v * r.have / r.base
 }
 
-// themeScale measures that factor by asking for the same part at 96 DPI.
-// OpenThemeDataForDpi reports 96 DPI sizes reliably even from a scaled window,
-// which is what makes it usable as a reference - it is only its margins that
-// ignore the request.
-//
-// Returns 1:1 when the DPI-aware entry point is missing, leaving the metrics as
-// the theme reported them.
+// themeScale compares the current check artwork with the same part at 96 DPI.
 func themeScale(hwnd w32.HWND, hdc w32.HDC, have int) themeRatio {
 	base := w32.OpenThemeDataForDpi(hwnd, "Menu", w32.USER_DEFAULT_SCREEN_DPI)
 	if base == 0 {
@@ -635,34 +603,34 @@ func (w *windowsWebviewWindow) currentMenuMetrics() *menuMetrics {
 	return w.menuMetrics
 }
 
-// menuItemFor resolves an owner-drawn item from the menu's draw mapping, keyed
-// by the identifier Windows reports in WM_DRAWITEM and WM_MEASUREITEM.
-//
-// Two mappings that look interchangeable are not. menuMapping is keyed by
-// command id alone, for WM_COMMAND dispatch; drawMapping is keyed by every
-// identifier a draw message can arrive under, which for an MF_POPUP item
-// includes the submenu's HMENU. Using menuMapping here silently fails to
-// resolve every submenu item.
-//
-// The global menuItemMap is not usable either: Menu.AddSeparator never registers
-// its item, so getMenuItemByID returns nil for every separator. drawMapping is
-// populated for all items, separators included, which lets separators be
-// identified explicitly rather than inferred from a failed lookup.
-// It resolves only items wails actually owner-draws. A menu bar item is present
-// in drawMapping too, but it is drawn by MenuBarWndProc, so claiming it here
-// would starve that handler and paint the bar with popup styling.
-func (w *windowsWebviewWindow) menuItemFor(itemID uint32) (*MenuItem, bool) {
+func (w *windowsWebviewWindow) invalidateMenuMetrics() {
+	w.menuMetrics.release()
+	w.menuMetrics = nil
+}
+
+// menuItemFor resolves the stable native data sent with owner-draw messages.
+func (w *windowsWebviewWindow) menuItemFor(itemData uintptr) (*MenuItem, bool) {
 	if w.menu == nil || w.menu.drawMapping == nil {
 		return nil, false
 	}
-	item, ok := w.menu.drawMapping[int(itemID)]
-	if !ok || item == nil {
+	entry, ok := w.menu.drawMapping[itemData]
+	if !ok || entry == nil || entry.item == nil {
 		return nil, false
 	}
-	if impl, ok := item.impl.(*windowsMenuItem); !ok || !impl.ownerDraw {
-		return nil, false
+	if err := entry.data.setText(menuItemDisplayText(entry.item)); err != nil {
+		if globalApplication != nil {
+			globalApplication.error("unable to refresh accessible menu label: %v", err)
+		}
 	}
-	return item, true
+	return entry.item, true
+}
+
+func menuItemDisplayText(item *MenuItem) string {
+	text := item.label
+	if item.accelerator != nil {
+		text += "\t" + item.accelerator.String()
+	}
+	return text
 }
 
 func menuItemLabelAccel(item *MenuItem) (label string, accel string) {
@@ -671,6 +639,77 @@ func menuItemLabelAccel(item *MenuItem) (label string, accel string) {
 		accel = item.accelerator.String()
 	}
 	return label, accel
+}
+
+func menuMnemonic(label string) (rune, bool) {
+	runes := []rune(label)
+	for i := 0; i < len(runes); i++ {
+		if runes[i] != '&' || i+1 >= len(runes) {
+			continue
+		}
+		if runes[i+1] == '&' {
+			i++
+			continue
+		}
+		return unicode.ToUpper(runes[i+1]), true
+	}
+	return 0, false
+}
+
+func menuCharResult(index int, action uint16) uintptr {
+	return uintptr(uint16(index)) | uintptr(action)<<16
+}
+
+// handleMenuChar restores mnemonic navigation, which Windows cannot infer for
+// owner-drawn strings.
+func (w *windowsWebviewWindow) handleMenuChar(wparam, lparam uintptr) (uintptr, bool) {
+	hmenu := w32.HMENU(lparam)
+	count := w32.GetMenuItemCount(hmenu)
+	if count <= 0 {
+		return 0, false
+	}
+
+	key := unicode.ToUpper(rune(uint16(wparam)))
+	selected := -1
+	owned := false
+	matches := make([]int, 0, 1)
+	for i := 0; i < count; i++ {
+		mii := w32.MENUITEMINFO{
+			CbSize: uint32(unsafe.Sizeof(w32.MENUITEMINFO{})),
+			FMask:  w32.MIIM_DATA | w32.MIIM_STATE,
+		}
+		if !w32.GetMenuItemInfo(hmenu, uint32(i), true, &mii) {
+			continue
+		}
+		item, ok := w.menuItemFor(mii.DwItemData)
+		if !ok {
+			continue
+		}
+		owned = true
+		if mii.FState&w32.MFS_HILITE != 0 {
+			selected = i
+		}
+		mnemonic, ok := menuMnemonic(item.label)
+		if ok && mnemonic == key && mii.FState&(w32.MFS_DISABLED|w32.MFS_GRAYED) == 0 {
+			matches = append(matches, i)
+		}
+	}
+
+	if !owned {
+		return 0, false
+	}
+	if len(matches) == 0 {
+		return menuCharResult(0, w32.MNC_IGNORE), true
+	}
+	if len(matches) == 1 {
+		return menuCharResult(matches[0], w32.MNC_EXECUTE), true
+	}
+	for _, index := range matches {
+		if index > selected {
+			return menuCharResult(index, w32.MNC_SELECT), true
+		}
+	}
+	return menuCharResult(matches[0], w32.MNC_SELECT), true
 }
 
 // withMenuFont selects the menu font for the duration of fn. It never hands
@@ -687,16 +726,8 @@ func (m *menuMetrics) withMenuFont(hdc w32.HDC, fn func()) {
 	}
 }
 
-// widestAccelerator returns the width of the widest accelerator in the popup
-// that item belongs to, or 0 if none of them has one.
-//
-// Windows sizes the accelerator column once for the whole popup so the
-// accelerators line up, and reserves it on every item including those without
-// one. Measuring each item against only its own accelerator makes the popup as
-// wide as its longest label and no wider, which leaves the accelerators nowhere
-// to sit - a 63px shortfall against the native menu in the case measured here.
-//
-// hdc must already have the menu font selected.
+// widestAccelerator sizes the shared accelerator column for one popup. hdc must
+// already have the menu font selected.
 func widestAccelerator(hdc w32.HDC, item *MenuItem) int {
 	impl, ok := item.impl.(*windowsMenuItem)
 	if !ok || impl.parent == nil {
@@ -705,9 +736,6 @@ func widestAccelerator(hdc w32.HDC, item *MenuItem) int {
 
 	widest := 0
 	for _, sibling := range impl.parent.items {
-		// Hidden items are skipped by buildMenuLevel before AppendMenu, so they
-		// occupy no row; reserving width for an accelerator that will never be
-		// drawn would just widen the popup.
 		if sibling.accelerator == nil || sibling.Hidden() {
 			continue
 		}
@@ -771,16 +799,64 @@ func (w *windowsWebviewWindow) menuColours() menuColours {
 	if w32.IsCurrentlyHighContrastMode() {
 		return systemMenuColours()
 	}
+
+	var colours menuColours
 	if w.menuOwnerDrawDark {
-		return darkMenuColours
+		colours = darkMenuColours
+	} else if m := w.currentMenuMetrics(); m != nil && m.havePalette {
+		// Light mode has a native menu to sample. Win32 exposes no equivalent
+		// dark popup palette, so dark mode uses the built-in colours above.
+		colours = m.lightPalette
+	} else {
+		colours = lightMenuColours
 	}
-	// Light mode has a native menu to match, so the surfaces come from the
-	// visual style rather than from the built-in palette. Dark mode has no such
-	// reference, since Win32 popups do not follow dark mode.
-	if m := w.currentMenuMetrics(); m != nil && m.havePalette {
-		return m.lightPalette
+
+	return applyCustomPopupColours(colours, w.customMenuBarTheme())
+}
+
+// customMenuBarTheme returns the resolved internal theme only when the user
+// supplied the matching public light/dark MenuBarTheme. The built-in dark menu
+// bar should not replace the standard popup palette.
+func (w *windowsWebviewWindow) customMenuBarTheme() *w32.MenuBarTheme {
+	if w == nil || w.parent == nil || w.menubarTheme == nil {
+		return nil
 	}
-	return lightMenuColours
+	custom := w.parent.options.Windows.CustomTheme
+	if w.menuOwnerDrawDark {
+		if custom.DarkModeMenuBar == nil {
+			return nil
+		}
+	} else if custom.LightModeMenuBar == nil {
+		return nil
+	}
+	return w.menubarTheme
+}
+
+// applyCustomPopupColours preserves the existing MenuBarTheme meaning:
+// Default paints normal rows and Selected paints the active popup row. Popup-
+// only supporting colours are derived because the public theme has no fields
+// for them.
+func applyCustomPopupColours(colours menuColours, theme *w32.MenuBarTheme) menuColours {
+	if theme == nil {
+		return colours
+	}
+	if theme.MenuBarBackground != nil {
+		colours.background = *theme.MenuBarBackground
+	}
+	if theme.TitleBarText != nil {
+		colours.text = *theme.TitleBarText
+	}
+	if theme.MenuSelectedBackground != nil {
+		colours.selectedBg = *theme.MenuSelectedBackground
+	}
+	if theme.MenuSelectedText != nil {
+		colours.selectedText = *theme.MenuSelectedText
+	}
+
+	colours.checkBackground = colours.selectedBg
+	colours.disabledText = mix(colours.background, colours.text, 50)
+	colours.separator = mix(colours.background, colours.text, 15)
+	return colours
 }
 
 // drawCheck paints the checkmark and the background panel behind it, centred in
@@ -840,7 +916,7 @@ func (w *windowsWebviewWindow) handleMeasureMenuItem(lparam uintptr) bool {
 
 	// Not one of ours: leave the message for whoever owns it rather than
 	// reporting a made-up size.
-	item, ok := w.menuItemFor(mis.ItemID)
+	item, ok := w.menuItemFor(mis.ItemData)
 	if !ok {
 		return false
 	}
@@ -864,20 +940,11 @@ func (w *windowsWebviewWindow) handleMeasureMenuItem(lparam uintptr) bool {
 	var labelW, labelH, accelW int
 	metrics.withMenuFont(hdc, func() {
 		labelW, labelH = measureText(hdc, label)
-		// The accelerator column is sized by the widest accelerator anywhere in
-		// this popup, not by this item's own. Windows reserves it on every item
-		// so the accelerators line up in a column; measuring per item makes the
-		// popup as wide as its longest label alone, and accelerators then have
-		// nowhere to sit.
 		accelW = widestAccelerator(hdc, item)
 	})
 	w32.ReleaseDC(w.hwnd, hdc)
 
-	// The submenu column is likewise reserved on every item, so an arrow can
-	// never be drawn over a label that was measured without it.
-	// labelReserve goes on unconditionally - Windows keeps it whether or not
-	// there is an accelerator to put in it, so a popup with none is otherwise
-	// too narrow by exactly that much.
+	// Native popups reserve label and submenu columns on every row.
 	width := metrics.textLeft() + labelW + metrics.itemPadRight + metrics.submenuWidth + metrics.reserve()
 	if accelW > 0 {
 		width += accelW
@@ -899,7 +966,7 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 
 	// Not one of ours - a menu bar item, or a menu belonging to another
 	// Win32Menu. Decline so MenuBarWndProc still sees it.
-	item, ok := w.menuItemFor(dis.ItemID)
+	item, ok := w.menuItemFor(dis.ItemData)
 	if !ok {
 		return false
 	}
@@ -919,21 +986,13 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 	w32.FillRect(dis.HDC, &rect, surface)
 	w32.DeleteObject(w32.HGDIOBJ(surface))
 
-	// The highlight is inset by the item's own horizontal padding rather than
-	// filling the row edge to edge. That padding is 0 on Windows 10, where a
-	// native band does span the popup, and 3 on Windows 11, where it does not -
-	// so the theme already describes the difference and no version check is
-	// needed.
+	// Theme padding captures the square Windows 10 and inset Windows 11 bands.
 	if selected && !disabled && !isSeparator {
 		band := rect
 		band.Left += int32(metrics.itemPadLeft)
 		band.Right -= int32(metrics.itemPadRight)
 		hot := w32.CreateSolidBrush(colours.selectedBg)
 
-		// Rounded to the same padding that insets it, which is 0 on Windows 10 -
-		// square band, spanning the row - and non-zero on Windows 11, where the
-		// band is both inset and rounded. One number describes both differences,
-		// so neither needs a version check.
 		radius := metrics.itemPadLeft
 		if radius > 0 {
 			rgn := w32.CreateRoundRectRgn(int(band.Left), int(band.Top),
@@ -953,9 +1012,7 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 	if isSeparator {
 		lineBrush := w32.CreateSolidBrush(colours.separator)
 		mid := rect.Top + (rect.Bottom-rect.Top)/2
-		// A separator spans the text column only, starting right of the gutter,
-		// the way MENU_POPUPSEPARATOR is drawn. Running it the full width of the
-		// popup is one of the things that reads as not-native.
+		// Native separators span the text column, not the check gutter.
 		line := w32.RECT{
 			Left:   rect.Left + int32(metrics.gutterWidth),
 			Top:    mid,
@@ -994,37 +1051,14 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 	labelRect.Right -= int32(metrics.itemPadRight + metrics.submenuWidth)
 	drawMenuString(dis.HDC, label, &labelRect, w32.DT_LEFT|w32.DT_SINGLELINE|w32.DT_VCENTER)
 
-	// No arrow is drawn here. Windows draws the submenu arrow itself, after
-	// WM_DRAWITEM returns, so anything painted in that column is covered a
-	// moment later - verified by deleting this drawing entirely and watching the
-	// arrow still appear. It uses the classic DFCS_MENUARROW triangle rather
-	// than the theme's chevron because owner-draw bypasses the themed path.
-	// paintSubmenuArrows, in menu_submenuarrow_windows.go, covers that triangle
-	// with a chevron from the popup window itself, which is the only surface
-	// Windows has finished with by then.
-	//
-	// The column is still reserved in handleMeasureMenuItem, because Windows
-	// reserves it too and the widths only match native when it is.
-	//
-	// Until that repaint lands, what can be controlled is the triangle's
-	// colour: it is a monochrome bitmap blit, which takes the device context's
-	// text colour. So for a submenu item the text colour is deliberately left
-	// set below rather than restored with the font and the background mode -
-	// otherwise the triangle is blitted in the system's menu text colour, dark
-	// and close to invisible on a dark background, for the frame before the
-	// chevron covers it.
+	// USER32 draws submenu arrows after WM_DRAWITEM. Leave its source text colour
+	// in place; the popup subclass replaces the classic triangle afterward.
 	if !hasSubmenu && accel != "" {
-		// Drawn in the item's own text colour. Windows does not dim
-		// accelerators - using the disabled colour made them look disabled,
-		// which is obvious under a High Contrast scheme where that colour is
-		// green rather than a slightly lighter grey.
 		accelRect := labelRect
 		drawMenuString(dis.HDC, accel, &accelRect, w32.DT_RIGHT|w32.DT_SINGLELINE|w32.DT_VCENTER)
 	}
 
-	// Left set for a submenu item, on purpose - see the arrow comment above.
-	// Every item sets its own colour before drawing, so the only thing reading
-	// it after this returns is Windows' arrow blit.
+	// Submenu arrows consume this colour after the callback returns.
 	if !hasSubmenu {
 		w32.SetTextColor(dis.HDC, oldTextColour)
 	}

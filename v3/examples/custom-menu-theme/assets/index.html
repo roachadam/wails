@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Custom Menu Theme POC</title>
+  <style>
+    :root {
+      color: #f7f2ff;
+      background: #181030;
+      font-family: system-ui, sans-serif;
+    }
+    body { margin: 0; padding: 40px; }
+    main { max-width: 760px; margin: auto; }
+    h1 { margin-top: 0; }
+    .comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    .card { padding: 20px; border: 1px solid #634994; border-radius: 10px; background: #21163d; }
+    .swatch { height: 42px; margin-top: 12px; border-radius: 6px; display: grid; place-items: center; }
+    .before { background: #212121; color: #dedede; }
+    .after { background: #2b174d; color: #f7f2ff; }
+    code { color: #76e4ed; }
+    .instruction { padding: 16px 20px; margin-top: 22px; background: #006d77; border-radius: 8px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Custom popup-menu theme POC</h1>
+  <p><strong>Build:</strong> <code>{{.Variant}}</code> · <strong>Wails:</strong> <code>{{.Commit}}</code></p>
+  <p>This window forces Wails dark mode and supplies a purple/teal <code>DarkModeMenuBar</code> theme.</p>
+  <div class="comparison">
+    <section class="card">
+      <h2>Before</h2>
+      <p>The menu bar is purple, but dropdown rows ignore the custom theme and use Wails' stock charcoal palette.</p>
+      <div class="swatch before">Stock popup row</div>
+    </section>
+    <section class="card">
+      <h2>After</h2>
+      <p>Normal dropdown rows are purple and selected rows are teal, matching the configured menu theme.</p>
+      <div class="swatch after">Custom popup row</div>
+    </section>
+  </div>
+  <p class="instruction">Open <strong>Theme</strong> in the native menu bar. Check normal, selected, disabled, checked, separator, and nested-submenu rendering.</p>
+</main>
+</body>
+</html>

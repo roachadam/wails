@@ -8,20 +8,8 @@ import (
 	"github.com/wailsapp/wails/v3/pkg/w32"
 )
 
-// Measuring how tall a themed glyph actually is.
-//
-// GetThemePartSize reports the box a part is laid out in, not the size of the
-// artwork inside it. For MENU_POPUPSUBMENU those differ: the chevron sits inside
-// its box with room around it, so sizing a replacement glyph to the box makes it
-// noticeably larger than the one Windows draws.
-//
-// The margins would normally answer this, but the submenu part reports none.
-// What is left is to draw the part and look at it: render it over white and find
-// the first and last rows that are not white. That is a measurement rather than
-// a constant, so it follows the DPI and any visual style.
-//
-// This is only the bounding box. Recovering the artwork itself - to recolour and
-// blit it - was tried and abandoned; the shapes come from a font instead.
+// Theme part bounds include transparent padding. Render the part over white and
+// measure changed rows to size the replacement font glyph to its visible ink.
 
 // themedInkHeight returns the height of the artwork a themed part draws, or 0
 // when it cannot be measured.

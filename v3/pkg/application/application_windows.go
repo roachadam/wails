@@ -276,6 +276,9 @@ func (m *windowsApp) wndProc(hwnd w32.HWND, msg uint32, wParam, lParam uintptr) 
 			m.restartingTaskbar.Store(false)
 		}()
 	case w32.WM_SETTINGCHANGE:
+		if window, ok := m.windowMap[hwnd]; ok {
+			window.invalidateMenuMetrics()
+		}
 		settingChanged := w32.UTF16PtrToString((*uint16)(unsafe.Pointer(lParam)))
 		if settingChanged == "ImmersiveColorSet" {
 			isDarkMode := w32.IsCurrentlyDarkMode()

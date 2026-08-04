@@ -117,14 +117,18 @@ func Lstrcpy(buf []uint16, lpString *uint16) {
 }
 
 func GlobalAlloc(uFlags uint, dwBytes uint32) HGLOBAL {
+	result := TryGlobalAlloc(uFlags, dwBytes)
+	if result == 0 {
+		panic("GlobalAlloc failed")
+	}
+	return result
+}
+
+// TryGlobalAlloc allocates global memory and returns 0 on failure.
+func TryGlobalAlloc(uFlags uint, dwBytes uint32) HGLOBAL {
 	ret, _, _ := procGlobalAlloc.Call(
 		uintptr(uFlags),
 		uintptr(dwBytes))
-
-	if ret == 0 {
-		panic("GlobalAlloc failed")
-	}
-
 	return HGLOBAL(ret)
 }
 

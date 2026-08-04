@@ -966,17 +966,8 @@ func drawMenuBarText(hwnd HWND, hdc HDC, menuBarInfo *MENUBARINFO, theme *MenuBa
 	}
 }
 
-// menuBarFont returns the user's menu font at hwnd's DPI, explicitly non-bold.
-//
-// The menu bar used to build this font from a LOGFONT with Height hardcoded to
-// -12, which is Segoe UI 9pt at 96 DPI and nothing else. On a scaled display it
-// was the wrong size, and because only some of the drawing paths applied it -
-// the rest fell through to whatever font the device context already had, which
-// is the correctly scaled one - a menu bar item visibly changed size when it
-// was hovered or when the window was maximised.
-//
-// Returns 0 when the metrics are unavailable; callers then leave the device
-// context's own font alone rather than substituting a guess.
+// menuBarFont returns the user's non-bold menu font at the window DPI. Callers
+// retain the DC font when non-client metrics are unavailable.
 func menuBarFont(hwnd HWND) HFONT {
 	ncm, ok := GetNonClientMetricsForDpi(GetDpiForWindow(hwnd))
 	if !ok {

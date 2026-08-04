@@ -47,6 +47,25 @@ const (
 	MSM_DISABLED = 2
 )
 
+// WM_MENUCHAR return actions.
+const (
+	MNC_IGNORE  = 0
+	MNC_CLOSE   = 1
+	MNC_EXECUTE = 2
+	MNC_SELECT  = 3
+)
+
+// MSAA_MENU_SIG identifies MSAAMENUINFO in an owner-drawn item's data.
+const MSAA_MENU_SIG = 0xAA0DF00D
+
+// MSAAMENUINFO exposes an owner-drawn menu item's label to accessibility tools.
+// It must be the first value in the data referenced by MENUITEMINFO.DwItemData.
+type MSAAMENUINFO struct {
+	DwMSAASignature uint32
+	CchWText        uint32
+	PszWText        *uint16
+}
+
 // MN_GETHMENU asks an open menu's window - class #32768 - for the HMENU it is
 // displaying. It is the only way to reach a popup's handle from outside the
 // menu loop.

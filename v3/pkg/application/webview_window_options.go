@@ -426,14 +426,16 @@ type TextTheme struct {
 	Background *uint32
 }
 
+// MenuBarTheme customizes the Windows menu bar. Default and Selected also
+// provide the normal and highlighted colours for popup menu rows.
 type MenuBarTheme struct {
-	// Default is the default theme
+	// Default defines normal top-level and popup rows.
 	Default *TextTheme
 
-	// Hover defines the theme to use when the menu item is hovered
+	// Hover defines the theme for a hovered top-level menu item.
 	Hover *TextTheme
 
-	// Selected defines the theme to use when the menu item is selected
+	// Selected defines the theme for an open top-level item or highlighted popup row.
 	Selected *TextTheme
 }
 

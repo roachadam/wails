@@ -22,7 +22,8 @@ type windowsMenuItem struct {
 	submenu  w32.HMENU
 	// ownerDraw marks popup items that wails paints itself. Menu bar items keep
 	// the existing UAH drawing and stay false.
-	ownerDraw bool
+	ownerDraw     bool
+	ownerDrawData *ownerDrawMenuData
 
 	// bitmap holds the HBITMAP handle installed by the most recent
 	// setBitmap call so it can be released before a new one is installed.
@@ -76,6 +77,13 @@ func (m *windowsMenuItem) update() {
 
 func (m *windowsMenuItem) setLabel(label string) {
 	m.label = label
+	if m.ownerDrawData != nil {
+		if err := m.ownerDrawData.setText(menuItemDisplayText(m.menuItem)); err != nil {
+			if globalApplication != nil {
+				globalApplication.error("unable to update accessible menu label: %v", err)
+			}
+		}
+	}
 	m.update()
 }
 
@@ -149,27 +157,26 @@ func (m *windowsMenuItem) setTooltip(_ string) {
 func (m *windowsMenuItem) getMenuInfo() *w32.MENUITEMINFO {
 	var mii w32.MENUITEMINFO
 	mii.CbSize = uint32(unsafe.Sizeof(mii))
-	mii.FMask = w32.MIIM_FTYPE | w32.MIIM_ID | w32.MIIM_STATE | w32.MIIM_STRING
+	mii.FMask = w32.MIIM_FTYPE | w32.MIIM_ID | w32.MIIM_STATE
 	if m.IsSeparator() {
 		mii.FType = w32.MFT_SEPARATOR
 	} else {
 		mii.FType = w32.MFT_STRING
-		if m.IsRadio() {
-			mii.FType |= w32.MFT_RADIOCHECK
-		}
-		thisText := m.label
-		if m.menuItem.accelerator != nil {
-			thisText += "\t" + m.menuItem.accelerator.String()
-		}
-		mii.DwTypeData = w32.MustStringToUTF16Ptr(thisText)
-		mii.Cch = uint32(len([]rune(thisText)))
 	}
-	// Preserve owner-draw across runtime updates. getMenuInfo feeds
-	// SetMenuItemInfo from setLabel/setChecked/setDisabled, which target the
-	// displayed menu; omitting the bit here would silently revert the item to
-	// system drawing after any mutation. Menu bar items are not owner-drawn.
+	if m.IsRadio() {
+		mii.FType |= w32.MFT_RADIOCHECK
+	}
 	if m.ownerDraw {
 		mii.FType |= w32.MFT_OWNERDRAW
+		mii.FMask |= w32.MIIM_DATA
+		if m.ownerDrawData != nil {
+			mii.DwItemData = m.ownerDrawData.itemData()
+		}
+	} else if !m.IsSeparator() {
+		thisText := menuItemDisplayText(m.menuItem)
+		mii.FMask |= w32.MIIM_STRING
+		mii.DwTypeData = w32.MustStringToUTF16Ptr(thisText)
+		mii.Cch = uint32(len([]rune(thisText)))
 	}
 	mii.WID = uint32(m.id)
 	if m.Enabled() {

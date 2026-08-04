@@ -10,33 +10,10 @@ import (
 	"github.com/wailsapp/wails/v3/pkg/w32"
 )
 
-// Replacing the submenu arrow Windows draws for owner-drawn items.
-//
-// For an owner-drawn item that opens a submenu, USER32 draws the arrow itself
-// once WM_DRAWITEM has returned, and it uses the classic triangle rather than
-// the theme's chevron because owner-draw bypasses the themed path. Anything
-// drawn in that column from WM_DRAWITEM is therefore painted over a moment
-// later - confirmed by deleting that drawing entirely and watching the triangle
-// still appear.
-//
-// The only place left to draw is the popup window itself, after Windows has
-// finished with it. WM_ENTERIDLE is sent to the menu's owner whenever the menu
-// loop runs out of messages, with the popup's handle in lParam, which is both a
-// handle to draw on and a signal that painting has settled. Hovering an item
-// repaints it and briefly restores the triangle; the next idle puts the chevron
-// back.
-
-// w32.MN_SELECTITEM is the message that repaints an item on hover, and
-// therefore the one that puts the classic triangle back.
-//
-// Popups have to be subclassed rather than repainted on idle. WM_ENTERIDLE only
-// arrives once the menu loop runs out of messages, so moving the pointer across
-// an item repaints it - triangle and all - and the chevron does not return until
-// the pointer stops. That reads as a flicker back to the wrong glyph.
-//
-// Subclassing lets the arrows be redrawn immediately after each repaint. The
-// original procedure is kept per window and restored when the menu loop ends,
-// because USER32 pools and reuses these windows.
+// USER32 paints a classic submenu triangle after WM_DRAWITEM returns. Popup
+// windows are temporarily subclassed so the themed chevron can replace it after
+// paint and selection messages. USER32 pools these windows, so every subclass
+// must be removed when the menu loop ends.
 var (
 	subclassed    sync.Map // w32.HWND -> uintptr, the original window procedure
 	subclassProc  = syscall.NewCallback(popupWndProc)

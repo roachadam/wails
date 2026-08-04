@@ -8,24 +8,8 @@ import (
 	"github.com/wailsapp/wails/v3/pkg/w32"
 )
 
-// Reading the light palette off the visual style.
-//
-// The light colours were hardcoded, and measuring native popups showed all of
-// them wrong: the popup surface is 242 on Windows 10 and 249 on Windows 11 where
-// wails used pure white, and the plate behind a checkmark is a stronger blue
-// than the wash that was guessed. No system colour matches either - COLOR_MENU
-// is 240, close to Windows 10 and wrong on Windows 11 - so there is nothing to
-// look them up from.
-//
-// They can be measured instead. DrawThemeBackground paints a part in the visual
-// style's own colours, which is exactly what is wanted here: the ink is the
-// answer rather than the problem. Rendering each part into a small bitmap and
-// reading a pixel gives what Windows would have drawn, on any style, without a
-// constant.
-//
-// Light only. Dark has no native reference - Win32 popup menus do not follow
-// dark mode, which is the whole reason this file's caller owner-draws them - so
-// that palette stays wails' own.
+// Light colours are sampled from visual-style parts because COLOR_MENU does not
+// match themed popups. Dark mode has no equivalent native popup palette.
 
 // sentinel is a colour no menu surface uses, so a part that declines to paint
 // can be told apart from one that painted something pale.
@@ -52,21 +36,14 @@ func themedLightColours(hwnd w32.HWND) (menuColours, bool) {
 
 	colours := lightMenuColours
 
-	// The popup surface. MENU_POPUPBACKGROUND is the part that fills it; some
-	// styles leave it to the item instead, so the item's own normal state is
-	// tried second.
+	// Some styles paint the normal item rather than the popup background.
 	if c, ok := s.fill(hTheme, w32.MENU_POPUPBACKGROUND, 0); ok {
 		colours.background = c
 	} else if c, ok := s.fill(hTheme, w32.MENU_POPUPITEM, w32.MPI_NORMAL); ok {
 		colours.background = c
 	}
 
-	// Text is asked for rather than sampled. Glyph pixels are anti-aliased
-	// against whatever is behind them, so reading one back gives a blend rather
-	// than the colour that was set.
-	//
-	// Read before the surfaces below, because the hot band is mixed from the
-	// item's own ink and would otherwise be mixed from the built-in palette's.
+	// Ask for text colours directly to avoid sampling anti-aliased glyph pixels.
 	for _, t := range []struct {
 		state int32
 		into  *uint32
@@ -80,27 +57,13 @@ func themedLightColours(hwnd w32.HWND) (menuColours, bool) {
 		}
 	}
 
-	// The plate behind a checkmark, and the band behind the item under the
-	// pointer. Both are drawn over the surface rather than instead of it -
-	// Windows 11's hot band is a translucent wash - so they are sampled over the
-	// surface colour and the result is what Windows would actually have drawn
-	// there. Priming with an arbitrary colour instead lets it show through: a
-	// grey wash over magenta is purple.
-	//
-	// A part that leaves the surface untouched has nothing to contribute, which
-	// is the right answer for the check plate on Windows 11, where a checked
-	// item is a bare tick with no plate at all.
+	// Translucent parts must be sampled over the popup surface.
 	colours.checkBackground = colours.background
 	if c, ok := s.fillOver(hTheme, w32.MENU_POPUPCHECKBACKGROUND, w32.MCB_NORMAL, colours.background); ok {
 		colours.checkBackground = c
 	}
 
-	// The hot band is the one colour the theme cannot be trusted for on Windows
-	// 11. MENU_POPUPITEM still paints Windows 10's blue there, while a native
-	// menu darkens the surface slightly instead - measured as 240 on a 249
-	// surface, with no blue in it. The legacy MENU_* parts describe Windows 10's
-	// style, which is the same reason their margins needed scaling; Windows 11
-	// draws its menus from a newer stack that leaves them behind.
+	// Windows 11 retains stale Windows 10 data for this legacy theme part.
 	if legacyMenuPartsAreStale() {
 		colours.selectedBg = mix(colours.background, colours.text, 4)
 	} else if c, ok := s.fillOver(hTheme, w32.MENU_POPUPITEM, w32.MPI_HOT, colours.background); ok {

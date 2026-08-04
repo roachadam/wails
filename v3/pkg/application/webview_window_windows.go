@@ -866,9 +866,7 @@ func (w *windowsWebviewWindow) destroy() {
 		w.parentHWND = 0
 	}
 
-	// Release the cached owner-draw menu font before the window goes away.
-	w.menuMetrics.release()
-	w.menuMetrics = nil
+	w.invalidateMenuMetrics()
 
 	// And any popup still subclassed. WM_EXITMENULOOP normally does this, but a
 	// window destroyed with a menu open never sees one, which would leave the
@@ -1496,6 +1494,7 @@ func (w *windowsWebviewWindow) updateTheme(isDarkMode bool) {
 	}
 
 	w32.SetTheme(w.hwnd, isDarkMode)
+	w.invalidateMenuMetrics()
 
 	// Owner-drawn menus pick their palette from the window's resolved theme, not
 	// from the system setting, so an explicit Dark theme stays dark on a light OS.
@@ -1621,6 +1620,10 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 		if w.handleDrawMenuItem(lparam) {
 			return 1
 		}
+	case w32.WM_MENUCHAR:
+		if result, handled := w.handleMenuChar(wparam, lparam); handled {
+			return result
+		}
 	case w32.WM_ENTERIDLE:
 		// The first sight of a popup's window handle, which is what makes this
 		// the place to take over its painting. See paintSubmenuArrows.
@@ -1631,6 +1634,8 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 		}
 	case w32.WM_EXITMENULOOP:
 		w.releasePopups()
+	case w32.WM_THEMECHANGED, w32.WM_SYSCOLORCHANGE, w32.WM_FONTCHANGE:
+		w.invalidateMenuMetrics()
 	}
 
 	// Use the original implementation that works perfectly for maximized
