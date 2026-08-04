@@ -870,6 +870,12 @@ func (w *windowsWebviewWindow) destroy() {
 	w.menuMetrics.release()
 	w.menuMetrics = nil
 
+	// And any popup still subclassed. WM_EXITMENULOOP normally does this, but a
+	// window destroyed with a menu open never sees one, which would leave the
+	// subclass installed on a window USER32 hands to the next menu and an owner
+	// pointer to a window that no longer exists.
+	w.releasePopups()
+
 	w.parent.markAsDestroyed()
 	// destroy the window
 	w32.DestroyWindow(w.hwnd)
@@ -1618,13 +1624,13 @@ func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintp
 	case w32.WM_ENTERIDLE:
 		// The first sight of a popup's window handle, which is what makes this
 		// the place to take over its painting. See paintSubmenuArrows.
-		if wparam == MSGF_MENU {
+		if wparam == w32.MSGF_MENU {
 			popup := w32.HWND(lparam)
 			w.subclassPopup(popup)
 			w.paintSubmenuArrows(popup)
 		}
 	case w32.WM_EXITMENULOOP:
-		releasePopups()
+		w.releasePopups()
 	}
 
 	// Use the original implementation that works perfectly for maximized

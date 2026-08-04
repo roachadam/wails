@@ -183,23 +183,6 @@ const (
 	iconChevronRight = "\ue76c" // ChevronRight, the submenu arrow
 )
 
-// newGlyphFont builds the icon font at the given size, falling back to Marlett
-// when it cannot draw the character.
-//
-// The check has to be for the glyph, not the typeface. GDI reports back
-// whatever face name was requested, so comparing names says nothing, and a font
-// that exists but lacks the codepoint draws a missing-glyph box - which reads as
-// a bug rather than a fallback.
-func newGlyphFont(hwnd w32.HWND, height int, icon, marlett string) (w32.HFONT, string) {
-	if font := newIconFont(height); font != 0 {
-		if fontCanDraw(hwnd, font, icon) {
-			return font, icon
-		}
-		w32.DeleteObject(w32.HGDIOBJ(font))
-	}
-	return newMarlettFont(height), marlett
-}
-
 // iconFontForInk builds the icon font at whatever size makes glyph's ink about
 // target pixels tall.
 //
@@ -384,18 +367,25 @@ func newMenuMetrics(hwnd w32.HWND) *menuMetrics {
 	// drawn item - a popup raises WM_DRAWITEM for every item on every repaint.
 	m.lightPalette, m.havePalette = themedLightColours(hwnd)
 
-	// Sized from the theme's own part sizes, so the glyphs scale with the menu
-	// rather than with the label font.
-	// Sized to the part's content box - the part less its own margins - rather
-	// than to the part. The theme pads its artwork, so the ink inside a 16px
-	// checkmark part is nearer 10px, and an icon glyph drawn at the full 16
-	// comes out visibly larger than the one Windows draws. The submenu part is
-	// barely padded, so its arrow gets close to the full size instead.
-	// Sized by the ink of the artwork Windows draws, the same as the arrow
-	// below. The em box undershoots because an icon font pads its glyphs inside
-	// the em, so a tick sized to the part's content box comes out noticeably
-	// smaller than the one a native menu draws. Falls back to the content box
-	// when the part cannot be measured.
+	// All three glyphs are sized to the ink of the artwork Windows draws, not to
+	// the part that artwork sits in and not to the em box of the font drawing
+	// it. Both of those were tried:
+	//
+	//   - The part overshoots. The theme pads its artwork, so the ink inside a
+	//     16px checkmark part is nearer 10px.
+	//   - The part's content box - the part less its own margins - is closer but
+	//     still wrong in both directions. It leaves the tick noticeably smaller
+	//     than a native one, because the em box an icon font is asked for is
+	//     itself larger than the glyph inside it, and it overshoots for the
+	//     submenu arrow, whose part reports no margins at all.
+	//
+	// Measuring the ink sidesteps the question: themedInkHeight renders the part
+	// and reports how tall the result actually is, so the target is what a
+	// native menu puts on screen. The content box remains the fallback for when
+	// there is no visual style to render.
+	//
+	// The measurement scales with the DPI and the style, so the glyphs follow
+	// the menu rather than the label font.
 	checkInk := themedInkHeight(hwnd, w32.MENU_POPUPCHECK, w32.MC_CHECKMARKNORMAL, m.checkWidth, m.checkHeight)
 	if checkInk <= 0 {
 		checkInk = contentBox(m.checkHeight, m.checkMarginY)
@@ -410,15 +400,10 @@ func newMenuMetrics(hwnd w32.HWND) *menuMetrics {
 		bulletInk = checkInk
 	}
 	m.bulletFont, m.bulletChar = newInkGlyph(hwnd, bulletInk, iconBullet, marlettBullet)
-	// The arrow is sized by its ink rather than by the em box. Its part carries
-	// almost no margin, so the target is the part itself, and at nine pixels the
-	// shortfall from em-box sizing is most of the glyph. The check and the
-	// bullet keep em-box sizing: their part's margins already describe the
-	// padding, so subtracting them lands in the right place.
-	// The target is the height of the artwork Windows actually draws, measured
-	// rather than assumed: the part's box is taller than the chevron inside it,
-	// so sizing to the box overshoots. Falls back to the box when the part
-	// cannot be measured, which is the case without a visual style.
+	// The arrow is where measuring the ink matters most. Its part reports no
+	// margins, so the content box is the whole part, and the part's box is
+	// visibly taller than the chevron inside it - at nine pixels on the stock
+	// style the difference is most of the glyph.
 	arrowInk := themedInkHeight(hwnd, w32.MENU_POPUPSUBMENU, w32.MSM_NORMAL, m.submenuGlyphW, m.submenuGlyph)
 	if arrowInk <= 0 {
 		arrowInk = contentBox(m.submenuGlyph, m.submenuMarginY)
@@ -510,8 +495,13 @@ func (m *menuMetrics) applyThemeMetrics(hwnd w32.HWND, hdc w32.HDC) {
 // so the arithmetic is exact and truncates the way the measurements did.
 type themeRatio struct{ have, base int }
 
+// apply leaves v alone unless both halves of the ratio are known. A zero
+// numerator is as much a failed measurement as a zero denominator: the part
+// whose size it comes from may be missing from an incomplete style, and
+// scaling every margin to nothing collapses the menu rather than falling back
+// to it.
 func (r themeRatio) apply(v int) int {
-	if r.base <= 0 {
+	if r.base <= 0 || r.have <= 0 {
 		return v
 	}
 	return v * r.have / r.base
@@ -649,9 +639,10 @@ func (w *windowsWebviewWindow) currentMenuMetrics() *menuMetrics {
 // by the identifier Windows reports in WM_DRAWITEM and WM_MEASUREITEM.
 //
 // Two mappings that look interchangeable are not. menuMapping is keyed by
-// command id for WM_COMMAND dispatch; drawMapping is keyed by whatever was
-// handed to AppendMenu, which for an MF_POPUP item is the submenu's HMENU
-// instead. Using menuMapping here silently fails to resolve every submenu item.
+// command id alone, for WM_COMMAND dispatch; drawMapping is keyed by every
+// identifier a draw message can arrive under, which for an MF_POPUP item
+// includes the submenu's HMENU. Using menuMapping here silently fails to
+// resolve every submenu item.
 //
 // The global menuItemMap is not usable either: Menu.AddSeparator never registers
 // its item, so getMenuItemByID returns nil for every separator. drawMapping is
@@ -727,12 +718,19 @@ func widestAccelerator(hdc w32.HDC, item *MenuItem) int {
 	return widest
 }
 
+// measureText returns the extent of s in the font selected into hdc.
+//
+// GetTextExtentPoint32 counts UTF-16 code units, not runes. Passing a rune
+// count measures a character short for every surrogate pair, so a label with an
+// emoji in it sizes its popup too narrow and gets clipped.
 func measureText(hdc w32.HDC, s string) (int, int) {
 	if s == "" {
 		return 0, 0
 	}
+	chars := w32.MustStringToUTF16(s)
+	chars = chars[:len(chars)-1] // drop the terminating NUL
 	var sz w32.SIZE
-	if !w32.GetTextExtentPoint32(hdc, w32.MustStringToUTF16Ptr(s), len([]rune(s)), &sz) {
+	if !w32.GetTextExtentPoint32(hdc, &chars[0], len(chars), &sz) {
 		return 0, 0
 	}
 	return int(sz.CX), int(sz.CY)
@@ -1000,17 +998,21 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 	// WM_DRAWITEM returns, so anything painted in that column is covered a
 	// moment later - verified by deleting this drawing entirely and watching the
 	// arrow still appear. It uses the classic DFCS_MENUARROW triangle rather
-	// than the theme's chevron because owner-draw bypasses the themed path,
-	// which is a difference from a native popup that owner-draw cannot close.
+	// than the theme's chevron because owner-draw bypasses the themed path.
+	// paintSubmenuArrows, in menu_submenuarrow_windows.go, covers that triangle
+	// with a chevron from the popup window itself, which is the only surface
+	// Windows has finished with by then.
 	//
 	// The column is still reserved in handleMeasureMenuItem, because Windows
 	// reserves it too and the widths only match native when it is.
 	//
-	// What can be controlled is its colour: the arrow is a monochrome bitmap
-	// blit, which takes the device context's text colour. Leaving that set to
-	// the item's ink rather than restoring it is what stops the arrow coming out
-	// in the system's menu text colour - dark, and close to invisible, on a dark
-	// background.
+	// Until that repaint lands, what can be controlled is the triangle's
+	// colour: it is a monochrome bitmap blit, which takes the device context's
+	// text colour. So for a submenu item the text colour is deliberately left
+	// set below rather than restored with the font and the background mode -
+	// otherwise the triangle is blitted in the system's menu text colour, dark
+	// and close to invisible on a dark background, for the frame before the
+	// chevron covers it.
 	if !hasSubmenu && accel != "" {
 		// Drawn in the item's own text colour. Windows does not dim
 		// accelerators - using the disabled colour made them look disabled,
@@ -1020,6 +1022,9 @@ func (w *windowsWebviewWindow) handleDrawMenuItem(lparam uintptr) bool {
 		drawMenuString(dis.HDC, accel, &accelRect, w32.DT_RIGHT|w32.DT_SINGLELINE|w32.DT_VCENTER)
 	}
 
+	// Left set for a submenu item, on purpose - see the arrow comment above.
+	// Every item sets its own colour before drawing, so the only thing reading
+	// it after this returns is Windows' arrow blit.
 	if !hasSubmenu {
 		w32.SetTextColor(dis.HDC, oldTextColour)
 	}

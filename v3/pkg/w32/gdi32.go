@@ -17,7 +17,6 @@ var (
 	procGetDeviceCaps             = modgdi32.NewProc("GetDeviceCaps")
 	procDeleteObject              = modgdi32.NewProc("DeleteObject")
 	procCreateFontIndirect        = modgdi32.NewProc("CreateFontIndirectW")
-	procGetTextFace               = modgdi32.NewProc("GetTextFaceW")
 	procGetGlyphIndices           = modgdi32.NewProc("GetGlyphIndicesW")
 	procGetGlyphOutline           = modgdi32.NewProc("GetGlyphOutlineW")
 	procCreateRoundRectRgn        = modgdi32.NewProc("CreateRoundRectRgn")
@@ -583,24 +582,6 @@ func ExtTextOut(hdc HDC, x, y int32, fuOptions uint32, lprc *RECT, lpString *uin
 		uintptr(cbCount),
 		dxPtr)
 	return ret != 0
-}
-
-// GetTextFace returns the typeface name of the font currently selected into hdc.
-//
-// GDI substitutes silently when a requested face is not installed, so this is
-// the only way to find out whether the font that got created is the font that
-// was asked for.
-func GetTextFace(hdc HDC) string {
-	var name [32]uint16 // LF_FACESIZE
-	ret, _, _ := procGetTextFace.Call(
-		uintptr(hdc),
-		uintptr(len(name)),
-		uintptr(unsafe.Pointer(&name[0])),
-	)
-	if ret == 0 {
-		return ""
-	}
-	return syscall.UTF16ToString(name[:])
 }
 
 // GGI_MARK_NONEXISTING_GLYPHS makes GetGlyphIndices report 0xffff for a

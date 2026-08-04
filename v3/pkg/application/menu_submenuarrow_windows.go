@@ -26,15 +26,9 @@ import (
 // repaints it and briefly restores the triangle; the next idle puts the chevron
 // back.
 
-// MSGF_MENU identifies a WM_ENTERIDLE that came from a menu rather than a
-// dialog.
-const MSGF_MENU = 2
-
-// MN_SELECTITEM is sent to a popup's window when the highlighted item changes.
-// It is the message that repaints an item on hover, and therefore the one that
-// puts the classic triangle back.
-const MN_SELECTITEM = 0x01E5
-
+// w32.MN_SELECTITEM is the message that repaints an item on hover, and
+// therefore the one that puts the classic triangle back.
+//
 // Popups have to be subclassed rather than repainted on idle. WM_ENTERIDLE only
 // arrives once the menu loop runs out of messages, so moving the pointer across
 // an item repaints it - triangle and all - and the chevron does not return until
@@ -65,15 +59,28 @@ func (w *windowsWebviewWindow) subclassPopup(popup w32.HWND) {
 	subclassOwner.Store(popup, w)
 }
 
+// releasePopup restores one popup's procedure and forgets it.
+func releasePopup(popup w32.HWND, original uintptr) {
+	w32.SetWindowLongPtr(popup, w32.GWLP_WNDPROC, original)
+	subclassed.Delete(popup)
+	subclassOwner.Delete(popup)
+}
+
 // releasePopups restores every popup procedure this window replaced. Menu
 // windows are reused by USER32, so leaving a subclass on one would have it
 // still installed the next time some other menu borrows that window.
-func releasePopups() {
+//
+// Only this window's own popups. Both callers - the end of its menu loop, and
+// its destruction - are per-window events, and a second window may have a menu
+// open at that moment; releasing its subclass would stop its arrows repainting
+// for the rest of that session.
+func (w *windowsWebviewWindow) releasePopups() {
 	subclassed.Range(func(key, value any) bool {
 		popup := key.(w32.HWND)
-		w32.SetWindowLongPtr(popup, w32.GWLP_WNDPROC, value.(uintptr))
-		subclassed.Delete(popup)
-		subclassOwner.Delete(popup)
+		if owner, ok := subclassOwner.Load(popup); !ok || owner != any(w) {
+			return true
+		}
+		releasePopup(popup, value.(uintptr))
 		return true
 	})
 }
@@ -89,10 +96,16 @@ func popupWndProc(popup w32.HWND, msg uint32, wparam, lparam uintptr) uintptr {
 	// After the default handling, not before: these are the messages that leave
 	// a freshly drawn triangle behind.
 	switch msg {
-	case w32.WM_PAINT, MN_SELECTITEM, w32.WM_PRINTCLIENT:
+	case w32.WM_PAINT, w32.MN_SELECTITEM, w32.WM_PRINTCLIENT:
 		if owner, ok := subclassOwner.Load(popup); ok {
 			owner.(*windowsWebviewWindow).paintSubmenuArrows(popup)
 		}
+	case w32.WM_NCDESTROY:
+		// The window is going away, so its entry has to as well. HWND values
+		// are recycled: a stale entry would make subclassPopup skip a genuinely
+		// new window, and would have releasePopups write a menu window's
+		// procedure into whatever unrelated window inherited the handle.
+		releasePopup(popup, original.(uintptr))
 	}
 	return result
 }

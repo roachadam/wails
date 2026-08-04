@@ -52,6 +52,14 @@ const (
 // menu loop.
 const MN_GETHMENU = 0x01E1
 
+// MN_SELECTITEM is sent to a popup's window when the highlighted item changes.
+// It is the message that repaints an item on hover.
+const MN_SELECTITEM = 0x01E5
+
+// MSGF_MENU identifies a WM_ENTERIDLE that came from a menu rather than a
+// dialog. From winuser.h.
+const MSGF_MENU = 2
+
 // THEMESIZE values for GetThemePartSize.
 const (
 	TS_MIN  = 0 // minimum size

@@ -61,6 +61,25 @@ func themedLightColours(hwnd w32.HWND) (menuColours, bool) {
 		colours.background = c
 	}
 
+	// Text is asked for rather than sampled. Glyph pixels are anti-aliased
+	// against whatever is behind them, so reading one back gives a blend rather
+	// than the colour that was set.
+	//
+	// Read before the surfaces below, because the hot band is mixed from the
+	// item's own ink and would otherwise be mixed from the built-in palette's.
+	for _, t := range []struct {
+		state int32
+		into  *uint32
+	}{
+		{w32.MPI_NORMAL, &colours.text},
+		{w32.MPI_HOT, &colours.selectedText},
+		{w32.MPI_DISABLED, &colours.disabledText},
+	} {
+		if c, ok := w32.GetThemeColor(hTheme, w32.MENU_POPUPITEM, t.state, w32.TMT_TEXTCOLOR); ok {
+			*t.into = uint32(c)
+		}
+	}
+
 	// The plate behind a checkmark, and the band behind the item under the
 	// pointer. Both are drawn over the surface rather than instead of it -
 	// Windows 11's hot band is a translucent wash - so they are sampled over the
@@ -88,22 +107,6 @@ func themedLightColours(hwnd w32.HWND) (menuColours, bool) {
 		colours.selectedBg = c
 	} else if c, ok := w32.GetThemeColor(hTheme, w32.MENU_POPUPITEM, w32.MPI_HOT, w32.TMT_FILLCOLOR); ok {
 		colours.selectedBg = uint32(c)
-	}
-
-	// Text is asked for rather than sampled. Glyph pixels are anti-aliased
-	// against whatever is behind them, so reading one back gives a blend rather
-	// than the colour that was set.
-	for _, t := range []struct {
-		state int32
-		into  *uint32
-	}{
-		{w32.MPI_NORMAL, &colours.text},
-		{w32.MPI_HOT, &colours.selectedText},
-		{w32.MPI_DISABLED, &colours.disabledText},
-	} {
-		if c, ok := w32.GetThemeColor(hTheme, w32.MENU_POPUPITEM, t.state, w32.TMT_TEXTCOLOR); ok {
-			*t.into = uint32(c)
-		}
 	}
 
 	// The divider. Unlike the others this part paints a thin rule and leaves the

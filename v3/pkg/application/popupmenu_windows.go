@@ -49,11 +49,16 @@ type Win32Menu struct {
 	parentWindow *windowsWebviewWindow
 	parent       w32.HWND
 	menuMapping  map[int]*MenuItem
-	// drawMapping resolves items for owner-draw, keyed by the identifier
-	// AppendMenu was actually given. That is the sequential command id for a
-	// normal item, but the submenu's HMENU for an MF_POPUP item, and WM_DRAWITEM
-	// reports whichever was used. menuMapping cannot serve both because it is
-	// keyed by command id for dispatch.
+	// drawMapping resolves items for owner-draw, keyed by every identifier
+	// WM_DRAWITEM and WM_MEASUREITEM can report an item by. That is the
+	// sequential command id, plus the submenu's HMENU for an MF_POPUP item,
+	// because AppendMenu takes the HMENU in place of the id for those - and an
+	// item re-inserted by SetMenuItemInfo reverts to the command id, so a
+	// submenu item can be reported by either over its lifetime. Entries are
+	// made for hidden items too, since setHidden(false) puts them back.
+	//
+	// menuMapping cannot serve this because it is keyed by command id alone,
+	// for WM_COMMAND dispatch.
 	drawMapping   map[int]*MenuItem
 	checkboxItems map[*MenuItem][]int
 	radioGroups   map[*MenuItem][]*RadioGroup
@@ -153,6 +158,12 @@ func (p *Win32Menu) buildMenuLevel(parentMenu w32.HMENU, inputMenu *Menu, ownerD
 		p.currentMenuID++
 		itemID := p.currentMenuID
 		p.menuMapping[itemID] = item
+		// Register the command id for owner-draw before anything below can skip
+		// or replace it. Hidden items are not appended now, but setHidden(false)
+		// re-inserts them later with SetMenuItemInfo, which writes the command
+		// id as the item's identifier - so an item registered only at
+		// AppendMenu time would come back unresolvable and be left unpainted.
+		p.drawMapping[itemID] = item
 
 		menuItemImpl := newMenuItemImpl(item, parentMenu, itemID)
 		menuItemImpl.parent = inputMenu
@@ -219,6 +230,12 @@ func (p *Win32Menu) buildMenuLevel(parentMenu w32.HMENU, inputMenu *Menu, ownerD
 			}
 			itemID = int(newSubmenu)
 			menuItemImpl.submenu = newSubmenu
+			// A second identifier for the same item. AppendMenu takes the
+			// submenu's HMENU in place of the command id for an MF_POPUP item,
+			// and WM_DRAWITEM reports back whichever value was used - the HMENU
+			// while the menu stands as built, the command id once
+			// SetMenuItemInfo has touched the item. Both have to resolve.
+			p.drawMapping[itemID] = item
 		}
 
 		var menuText = item.Label()
@@ -239,12 +256,6 @@ func (p *Win32Menu) buildMenuLevel(parentMenu w32.HMENU, inputMenu *Menu, ownerD
 		if item.Hidden() {
 			continue
 		}
-
-		// Record the item under the identifier AppendMenu is about to be given.
-		// For an MF_POPUP item that is the submenu's HMENU rather than the
-		// command id, and WM_DRAWITEM/WM_MEASUREITEM report the same value, so
-		// this is the only key an owner-draw lookup can use.
-		p.drawMapping[itemID] = item
 
 		ok := w32.AppendMenu(parentMenu, flags, uintptr(itemID), w32.MustStringToUTF16Ptr(menuText))
 		if !ok {
