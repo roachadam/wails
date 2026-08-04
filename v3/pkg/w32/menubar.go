@@ -485,19 +485,7 @@ func MenuBarWndProc(hwnd HWND, msg uint32, wParam WPARAM, lParam LPARAM, theme *
 
 		// When maximized/fullscreen and menubar item, use the same font settings as drawMenuBarText
 		if isMaximized && isMenuBarItem {
-			// Create a non-bold font explicitly
-			menuFont := LOGFONT{
-				Height:         -12, // Standard Windows menu font height (9pt)
-				Weight:         400, // FW_NORMAL (not bold)
-				CharSet:        1,   // DEFAULT_CHARSET
-				Quality:        5,   // CLEARTYPE_QUALITY
-				PitchAndFamily: 0,   // DEFAULT_PITCH
-			}
-			// Set font face name to "Segoe UI" (Windows default)
-			fontName := []uint16{'S', 'e', 'g', 'o', 'e', ' ', 'U', 'I', 0}
-			copy(menuFont.FaceName[:], fontName)
-
-			hFont := CreateFontIndirect(&menuFont)
+			hFont := menuBarFont(hwnd)
 			if hFont != 0 {
 				oldFont := SelectObject(udmi.UM.Hdc, HGDIOBJ(hFont))
 				DrawText(udmi.UM.Hdc, menuString, -1, &udmi.DIS.RcItem, dwFlags)
@@ -923,19 +911,7 @@ func drawMenuBarText(hwnd HWND, hdc HDC, menuBarInfo *MENUBARINFO, theme *MenuBa
 		return
 	}
 
-	// Create a non-bold font explicitly
-	menuFont := LOGFONT{
-		Height:         -12, // Standard Windows menu font height (9pt)
-		Weight:         400, // FW_NORMAL (not bold)
-		CharSet:        1,   // DEFAULT_CHARSET
-		Quality:        5,   // CLEARTYPE_QUALITY
-		PitchAndFamily: 0,   // DEFAULT_PITCH
-	}
-	// Set font face name to "Segoe UI" (Windows default)
-	fontName := []uint16{'S', 'e', 'g', 'o', 'e', ' ', 'U', 'I', 0}
-	copy(menuFont.FaceName[:], fontName)
-
-	hFont := CreateFontIndirect(&menuFont)
+	hFont := menuBarFont(hwnd)
 	if hFont != 0 {
 		oldFont := SelectObject(hdc, HGDIOBJ(hFont))
 		defer func() {
@@ -988,4 +964,25 @@ func drawMenuBarText(hwnd HWND, hdc HDC, menuBarInfo *MENUBARINFO, theme *MenuBa
 			DrawText(hdc, menuString, -1, &itemRect, DT_CENTER|DT_SINGLELINE|DT_VCENTER)
 		}
 	}
+}
+
+// menuBarFont returns the user's menu font at hwnd's DPI, explicitly non-bold.
+//
+// The menu bar used to build this font from a LOGFONT with Height hardcoded to
+// -12, which is Segoe UI 9pt at 96 DPI and nothing else. On a scaled display it
+// was the wrong size, and because only some of the drawing paths applied it -
+// the rest fell through to whatever font the device context already had, which
+// is the correctly scaled one - a menu bar item visibly changed size when it
+// was hovered or when the window was maximised.
+//
+// Returns 0 when the metrics are unavailable; callers then leave the device
+// context's own font alone rather than substituting a guess.
+func menuBarFont(hwnd HWND) HFONT {
+	ncm, ok := GetNonClientMetricsForDpi(GetDpiForWindow(hwnd))
+	if !ok {
+		return 0
+	}
+	lf := ncm.MenuFont
+	lf.Weight = FW_NORMAL
+	return CreateFontIndirect(&lf)
 }

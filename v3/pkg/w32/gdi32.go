@@ -17,6 +17,10 @@ var (
 	procGetDeviceCaps             = modgdi32.NewProc("GetDeviceCaps")
 	procDeleteObject              = modgdi32.NewProc("DeleteObject")
 	procCreateFontIndirect        = modgdi32.NewProc("CreateFontIndirectW")
+	procGetGlyphIndices           = modgdi32.NewProc("GetGlyphIndicesW")
+	procGetGlyphOutline           = modgdi32.NewProc("GetGlyphOutlineW")
+	procCreateRoundRectRgn        = modgdi32.NewProc("CreateRoundRectRgn")
+	procFillRgn                   = modgdi32.NewProc("FillRgn")
 	procAbortDoc                  = modgdi32.NewProc("AbortDoc")
 	procBitBlt                    = modgdi32.NewProc("BitBlt")
 	procPatBlt                    = modgdi32.NewProc("PatBlt")
@@ -577,5 +581,122 @@ func ExtTextOut(hdc HDC, x, y int32, fuOptions uint32, lprc *RECT, lpString *uin
 		uintptr(unsafe.Pointer(lpString)),
 		uintptr(cbCount),
 		dxPtr)
+	return ret != 0
+}
+
+// GGI_MARK_NONEXISTING_GLYPHS makes GetGlyphIndices report 0xffff for a
+// character the font has no glyph for, rather than the default glyph.
+const GGI_MARK_NONEXISTING_GLYPHS = 1
+
+// FontHasGlyphs reports whether the font selected into hdc can draw every
+// character of s.
+//
+// This is the question worth asking before using an icon font. Comparing
+// typeface names does not answer it - GDI reports back the name that was
+// requested - and a font that is present but lacks the codepoint draws a
+// missing-glyph box, which looks like a bug rather than a fallback.
+func FontHasGlyphs(hdc HDC, s string) bool {
+	chars := MustStringToUTF16(s)
+	chars = chars[:len(chars)-1] // drop the terminating NUL
+	if len(chars) == 0 {
+		return false
+	}
+
+	indices := make([]uint16, len(chars))
+	ret, _, _ := procGetGlyphIndices.Call(
+		uintptr(hdc),
+		uintptr(unsafe.Pointer(&chars[0])),
+		uintptr(len(chars)),
+		uintptr(unsafe.Pointer(&indices[0])),
+		GGI_MARK_NONEXISTING_GLYPHS,
+	)
+	if ret == 0xffffffff { // GDI_ERROR
+		return false
+	}
+	for _, i := range indices {
+		if i == 0xffff {
+			return false
+		}
+	}
+	return true
+}
+
+// GGO_METRICS asks GetGlyphOutline for a glyph's metrics without its outline.
+const GGO_METRICS = 0
+
+// FIXED is a 16.16 fixed-point value.
+type FIXED struct {
+	Fract uint16
+	Value int16
+}
+
+// MAT2 is the transform GetGlyphOutline applies before measuring.
+type MAT2 struct {
+	EM11 FIXED
+	EM12 FIXED
+	EM21 FIXED
+	EM22 FIXED
+}
+
+// GLYPHMETRICS describes a glyph's ink, as opposed to the box it is laid out in.
+type GLYPHMETRICS struct {
+	GmBlackBoxX     uint32
+	GmBlackBoxY     uint32
+	GmptGlyphOrigin POINT
+	GmCellIncX      int16
+	GmCellIncY      int16
+}
+
+// GlyphInkHeight returns how tall a character's ink actually is in the font
+// currently selected into hdc.
+//
+// A font's em box is not its ink. Icon fonts leave padding inside the em, so
+// asking for a font of height N and expecting an N-pixel glyph comes up short -
+// which is the difference between a chevron that matches Windows' and one that
+// looks thin and grey beside it.
+//
+// Reports 0 when the glyph has no outline, which includes whitespace.
+func GlyphInkHeight(hdc HDC, r rune) int {
+	identity := MAT2{
+		EM11: FIXED{Value: 1},
+		EM22: FIXED{Value: 1},
+	}
+	var gm GLYPHMETRICS
+	ret, _, _ := procGetGlyphOutline.Call(
+		uintptr(hdc),
+		uintptr(r),
+		GGO_METRICS,
+		uintptr(unsafe.Pointer(&gm)),
+		0,
+		0,
+		uintptr(unsafe.Pointer(&identity)),
+	)
+	if ret == 0xffffffff { // GDI_ERROR
+		return 0
+	}
+	return int(gm.GmBlackBoxY)
+}
+
+// CreateRoundRectRgn makes a rectangular region with rounded corners.
+//
+// The ellipse arguments are the full width and height of the corner ellipse, so
+// a corner radius of r is passed as 2*r.
+//
+// Returns 0 on failure; callers must DeleteObject the result.
+func CreateRoundRectRgn(left, top, right, bottom, ellipseWidth, ellipseHeight int) HRGN {
+	ret, _, _ := procCreateRoundRectRgn.Call(
+		uintptr(left),
+		uintptr(top),
+		uintptr(right),
+		uintptr(bottom),
+		uintptr(ellipseWidth),
+		uintptr(ellipseHeight),
+	)
+	return HRGN(ret)
+}
+
+// FillRgn fills a region with a brush.
+func FillRgn(hdc HDC, hrgn HRGN, brush HBRUSH) bool {
+	ret, _, _ := procFillRgn.Call(uintptr(hdc), uintptr(hrgn), uintptr(brush))
 	return ret != 0
 }

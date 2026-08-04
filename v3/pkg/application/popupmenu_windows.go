@@ -44,11 +44,22 @@ func (r *RadioGroup) MenuID(item *MenuItem) int {
 }
 
 type Win32Menu struct {
-	isPopup       bool
-	menu          w32.HMENU
-	parentWindow  *windowsWebviewWindow
-	parent        w32.HWND
-	menuMapping   map[int]*MenuItem
+	isPopup      bool
+	menu         w32.HMENU
+	parentWindow *windowsWebviewWindow
+	parent       w32.HWND
+	menuMapping  map[int]*MenuItem
+	// drawMapping resolves items for owner-draw, keyed by every identifier
+	// WM_DRAWITEM and WM_MEASUREITEM can report an item by. That is the
+	// sequential command id, plus the submenu's HMENU for an MF_POPUP item,
+	// because AppendMenu takes the HMENU in place of the id for those - and an
+	// item re-inserted by SetMenuItemInfo reverts to the command id, so a
+	// submenu item can be reported by either over its lifetime. Entries are
+	// made for hidden items too, since setHidden(false) puts them back.
+	//
+	// menuMapping cannot serve this because it is keyed by command id alone,
+	// for WM_COMMAND dispatch.
+	drawMapping   map[int]*MenuItem
 	checkboxItems map[*MenuItem][]int
 	radioGroups   map[*MenuItem][]*RadioGroup
 	menuData      *Menu
@@ -97,19 +108,66 @@ func (p *Win32Menu) newMenu() w32.HMENU {
 	return w32.CreateMenu()
 }
 
-// buildMenu populates parentMenu from inputMenu. Any native AppendMenu or
+// buildMenuBar populates the top level of an application menu. Those items form
+// the menu bar strip, which MenuBarWndProc already draws, so they are left to
+// the system. Everything hanging below them is a popup and is built by
+// buildPopupMenu.
+func (p *Win32Menu) buildMenuBar(parentMenu w32.HMENU, inputMenu *Menu) error {
+	return p.buildMenuLevel(parentMenu, inputMenu, false)
+}
+
+// buildPopupMenu populates a dropdown, a context menu, or a nested submenu.
+// Its items are owner-drawn only for the application menu - see ownerDrawPopups.
+func (p *Win32Menu) buildPopupMenu(parentMenu w32.HMENU, inputMenu *Menu) error {
+	return p.buildMenuLevel(parentMenu, inputMenu, p.ownerDrawPopups())
+}
+
+// ownerDrawPopups reports whether wails paints this menu's popup items itself.
+//
+// Only the application menu qualifies, and being a popup is not the test.
+// Owner-draw exists to supply a text colour to match a background wails has
+// painted, and updateTheme paints that background on exactly one HMENU:
+// w.menu.menu, the application menu. Context menus and system tray menus are
+// created by NewPopupMenu, never receive that background, and render correctly
+// as native menus - so owner-drawing them fixes nothing.
+//
+// It also breaks them. Their items resolve through the window's application
+// menu mapping, and because every Win32Menu restarts its ids at MenuItemMsgID,
+// a context menu item aliases whichever application menu item shares its id and
+// is drawn with that item's label. A system tray menu is worse still: its owner
+// window handles neither WM_MEASUREITEM nor WM_DRAWITEM, so its items get no
+// size and are never painted at all.
+//
+// parentWindow is set only by NewApplicationMenu, which makes it exactly the
+// "this menu belongs to a window whose theme we manage and whose WndProc
+// handles owner-draw" test.
+func (p *Win32Menu) ownerDrawPopups() bool {
+	return p.parentWindow != nil
+}
+
+// buildMenuLevel populates parentMenu from inputMenu. Any native AppendMenu or
 // SetMenuIcons failure returns an error; recursive submenu builds propagate
 // the error so the outer Update can back out cleanly instead of attaching a
 // half-built submenu via MF_POPUP.
-func (p *Win32Menu) buildMenu(parentMenu w32.HMENU, inputMenu *Menu) error {
+//
+// Call it through buildMenuBar or buildPopupMenu rather than directly, so the
+// owner-draw decision is named at the call site.
+func (p *Win32Menu) buildMenuLevel(parentMenu w32.HMENU, inputMenu *Menu, ownerDraw bool) error {
 	currentRadioGroup := RadioGroup{}
 	for _, item := range inputMenu.items {
 		p.currentMenuID++
 		itemID := p.currentMenuID
 		p.menuMapping[itemID] = item
+		// Register the command id for owner-draw before anything below can skip
+		// or replace it. Hidden items are not appended now, but setHidden(false)
+		// re-inserts them later with SetMenuItemInfo, which writes the command
+		// id as the item's identifier - so an item registered only at
+		// AppendMenu time would come back unresolvable and be left unpainted.
+		p.drawMapping[itemID] = item
 
 		menuItemImpl := newMenuItemImpl(item, parentMenu, itemID)
 		menuItemImpl.parent = inputMenu
+		menuItemImpl.ownerDraw = ownerDraw
 		item.impl = menuItemImpl
 
 		if item.Hidden() {
@@ -125,6 +183,12 @@ func (p *Win32Menu) buildMenu(parentMenu w32.HMENU, inputMenu *Menu) error {
 		}
 
 		flags := uint32(w32.MF_STRING)
+		// Popup items are owner-drawn so wails controls the text colour rather
+		// than inheriting it from uxtheme, which follows the system light/dark
+		// setting. The menu bar keeps its existing UAH drawing.
+		if ownerDraw {
+			flags = flags | w32.MF_OWNERDRAW
+		}
 		if item.disabled {
 			flags = flags | w32.MF_GRAYED
 		}
@@ -157,7 +221,7 @@ func (p *Win32Menu) buildMenu(parentMenu w32.HMENU, inputMenu *Menu) error {
 		if item.submenu != nil {
 			flags = flags | w32.MF_POPUP
 			newSubmenu := p.newMenu()
-			if err := p.buildMenu(newSubmenu, item.submenu); err != nil {
+			if err := p.buildPopupMenu(newSubmenu, item.submenu); err != nil {
 				// Submenu was allocated but never attached via AppendMenu, so
 				// the outer DestroyMenu on parentMenu won't reach it. Free it
 				// here to avoid leaking the HMENU.
@@ -166,6 +230,12 @@ func (p *Win32Menu) buildMenu(parentMenu w32.HMENU, inputMenu *Menu) error {
 			}
 			itemID = int(newSubmenu)
 			menuItemImpl.submenu = newSubmenu
+			// A second identifier for the same item. AppendMenu takes the
+			// submenu's HMENU in place of the command id for an MF_POPUP item,
+			// and WM_DRAWITEM reports back whichever value was used - the HMENU
+			// while the menu stands as built, the command id once
+			// SetMenuItemInfo has touched the item. Both have to resolve.
+			p.drawMapping[itemID] = item
 		}
 
 		var menuText = item.Label()
@@ -221,6 +291,7 @@ func (p *Win32Menu) Update() {
 	newHMENU := p.newMenu()
 	oldHMENU := p.menu
 	oldMapping := p.menuMapping
+	oldDrawMapping := p.drawMapping
 	oldCheckboxes := p.checkboxItems
 	oldRadios := p.radioGroups
 	oldBitmaps := p.bitmaps
@@ -237,12 +308,20 @@ func (p *Win32Menu) Update() {
 
 	p.menu = newHMENU
 	p.menuMapping = make(map[int]*MenuItem)
+	p.drawMapping = make(map[int]*MenuItem)
 	p.checkboxItems = make(map[*MenuItem][]int)
 	p.radioGroups = make(map[*MenuItem][]*RadioGroup)
 	p.currentMenuID = MenuItemMsgID
 	p.bitmaps = nil
 
-	if err := p.buildMenu(newHMENU, p.menuData); err != nil {
+	// A context menu is a popup in its own right; an application menu starts at
+	// the bar, and only what hangs below it is a popup.
+	build := p.buildMenuBar
+	if p.isPopup {
+		build = p.buildPopupMenu
+	}
+
+	if err := build(newHMENU, p.menuData); err != nil {
 		globalApplication.error("menu rebuild failed, keeping previous menu: %v", err)
 		// Release bitmaps allocated during the partial build, destroy the
 		// partial HMENU, then restore the previous state.
@@ -250,6 +329,7 @@ func (p *Win32Menu) Update() {
 		w32.DestroyMenu(newHMENU)
 		p.menu = oldHMENU
 		p.menuMapping = oldMapping
+		p.drawMapping = oldDrawMapping
 		p.checkboxItems = oldCheckboxes
 		p.radioGroups = oldRadios
 		p.bitmaps = oldBitmaps

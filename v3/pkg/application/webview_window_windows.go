@@ -22,9 +22,9 @@ import (
 	"github.com/wailsapp/wails/v3/internal/sliceutil"
 	"github.com/wailsapp/wails/v3/internal/webview2/webviewloader"
 
+	"github.com/wailsapp/wails/v3/internal/webview2/pkg/edge"
 	"github.com/wailsapp/wails/v3/pkg/events"
 	"github.com/wailsapp/wails/v3/pkg/w32"
-	"github.com/wailsapp/wails/v3/internal/webview2/pkg/edge"
 )
 
 var edgeMap = map[string]uintptr{
@@ -44,7 +44,13 @@ type windowsWebviewWindow struct {
 	hwnd                     w32.HWND
 	menu                     *Win32Menu
 	currentlyOpenContextMenu *Win32Menu
-	ignoreDPIChangeResizing  bool
+	// menuOwnerDrawDark selects the palette for owner-drawn popup menu items.
+	// It follows the window's resolved theme rather than the system setting.
+	menuOwnerDrawDark bool
+	// menuMetrics caches the owner-draw layout for the window's current DPI.
+	// Rebuilt when the window moves to a display with a different DPI.
+	menuMetrics             *menuMetrics
+	ignoreDPIChangeResizing bool
 
 	// Fullscreen flags
 	isCurrentlyFullscreen   bool
@@ -860,6 +866,16 @@ func (w *windowsWebviewWindow) destroy() {
 		w.parentHWND = 0
 	}
 
+	// Release the cached owner-draw menu font before the window goes away.
+	w.menuMetrics.release()
+	w.menuMetrics = nil
+
+	// And any popup still subclassed. WM_EXITMENULOOP normally does this, but a
+	// window destroyed with a menu open never sees one, which would leave the
+	// subclass installed on a window USER32 hands to the next menu and an owner
+	// pointer to a window that no longer exists.
+	w.releasePopups()
+
 	w.parent.markAsDestroyed()
 	// destroy the window
 	w32.DestroyWindow(w.hwnd)
@@ -1481,6 +1497,10 @@ func (w *windowsWebviewWindow) updateTheme(isDarkMode bool) {
 
 	w32.SetTheme(w.hwnd, isDarkMode)
 
+	// Owner-drawn menus pick their palette from the window's resolved theme, not
+	// from the system setting, so an explicit Dark theme stays dark on a light OS.
+	w.menuOwnerDrawDark = isDarkMode
+
 	// Clear any existing theme first
 	if w.menubarTheme != nil && !isDarkMode {
 		// Reset menu to default Windows theme when switching to light mode
@@ -1589,6 +1609,29 @@ func (w *windowsWebviewWindow) isActive() bool {
 }
 
 func (w *windowsWebviewWindow) WndProc(msg uint32, wparam, lparam uintptr) uintptr {
+
+	// Owner-drawn popup menu items must be handled before MenuBarWndProc, whose
+	// own WM_DRAWITEM case targets the menu bar (centred text, title-bar brush).
+	switch msg {
+	case w32.WM_MEASUREITEM:
+		if w.handleMeasureMenuItem(lparam) {
+			return 1
+		}
+	case w32.WM_DRAWITEM:
+		if w.handleDrawMenuItem(lparam) {
+			return 1
+		}
+	case w32.WM_ENTERIDLE:
+		// The first sight of a popup's window handle, which is what makes this
+		// the place to take over its painting. See paintSubmenuArrows.
+		if wparam == w32.MSGF_MENU {
+			popup := w32.HWND(lparam)
+			w.subclassPopup(popup)
+			w.paintSubmenuArrows(popup)
+		}
+	case w32.WM_EXITMENULOOP:
+		w.releasePopups()
+	}
 
 	// Use the original implementation that works perfectly for maximized
 	processed, code := w32.MenuBarWndProc(w.hwnd, msg, wparam, lparam, w.menubarTheme)
