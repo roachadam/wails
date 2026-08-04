@@ -128,6 +128,11 @@ type menuMetrics struct {
 	// labelReserveScaled is labelReserve in this DPI's units. See themeScale.
 	labelReserveScaled int
 
+	// lightPalette is the light-mode palette read off the visual style, and
+	// havePalette whether it could be. See themedLightColours.
+	lightPalette menuColours
+	havePalette  bool
+
 	// themed records whether the measurements came from the visual style.
 	themed bool
 }
@@ -357,6 +362,10 @@ func newMenuMetrics(hwnd w32.HWND) *menuMetrics {
 
 	m.applyFallbacks()
 	m.finalise()
+
+	// Sampled here so it happens once per metrics rebuild rather than once per
+	// drawn item - a popup raises WM_DRAWITEM for every item on every repaint.
+	m.lightPalette, m.havePalette = themedLightColours(hwnd)
 
 	// Sized from the theme's own part sizes, so the glyphs scale with the menu
 	// rather than with the label font.
@@ -739,6 +748,12 @@ func (w *windowsWebviewWindow) menuColours() menuColours {
 	}
 	if w.menuOwnerDrawDark {
 		return darkMenuColours
+	}
+	// Light mode has a native menu to match, so the surfaces come from the
+	// visual style rather than from the built-in palette. Dark mode has no such
+	// reference, since Win32 popups do not follow dark mode.
+	if m := w.currentMenuMetrics(); m != nil && m.havePalette {
+		return m.lightPalette
 	}
 	return lightMenuColours
 }

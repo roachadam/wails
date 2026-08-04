@@ -65,6 +65,12 @@ const (
 	TMT_CONTENTMARGINS = 3602
 )
 
+// Theme property ids for GetThemeColor.
+const (
+	TMT_FILLCOLOR = 3802
+	TMT_TEXTCOLOR = 3803
+)
+
 var (
 	procGetThemePartSize = uxtheme.NewProc("GetThemePartSize")
 	procGetThemeMargins  = uxtheme.NewProc("GetThemeMargins")
@@ -163,4 +169,29 @@ func OpenThemeDataForDpi(hwnd HWND, classList string, dpi UINT) HTHEME {
 		uintptr(dpi),
 	)
 	return HTHEME(ret)
+}
+
+
+var procGetThemeColor = uxtheme.NewProc("GetThemeColor")
+
+// GetThemeColor returns a colour property of a themed part.
+//
+// Text colours are worth asking for rather than sampling: a glyph's pixels are
+// anti-aliased against their background, so reading one back gives a blend
+// rather than the colour that was set.
+//
+// Reports false when the theme does not supply the property.
+func GetThemeColor(hTheme HTHEME, iPartId, iStateId, iPropId int32) (COLORREF, bool) {
+	var c COLORREF
+	ret, _, _ := procGetThemeColor.Call(
+		uintptr(hTheme),
+		uintptr(iPartId),
+		uintptr(iStateId),
+		uintptr(iPropId),
+		uintptr(unsafe.Pointer(&c)),
+	)
+	if ret != 0 {
+		return 0, false
+	}
+	return c, true
 }
